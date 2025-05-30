@@ -1,2 +1,2 @@
-# minpop
-Minimal Basis Set Population Analysis
+# MinPop
+Minimal Basis Set Population Analysis Code
