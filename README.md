@@ -1,4 +1,4 @@
-# MinPop: Minimum Population Localization Analysis for PySCF
+# MinPop PySCF: Minimum Population Localization Analysis for PySCF
 
 A Python implementation of Minimum Population (MinPop) localization analysis for open- and closed-shell Hartree-Fock wavefunctions. Projects molecular orbitals onto a minimal basis set (STO-3G) for chemically intuitive population analysis with output matching Gaussian 16.
 
