@@ -1,10 +1,12 @@
-# MinPop PySCF: Minimum Population Localization Analysis for PySCF
+# MinPop: Minimum Population Localization Analysis for PySCF
 
-A Python implementation of Minimum Population (MinPop) localization analysis for open- and closed-shell Hartree-Fock wavefunctions. Projects molecular orbitals onto a minimal basis set (STO-3G) for chemically intuitive population analysis with output matching Gaussian 16.
+A Python implementation of Minimum Population (MinPop) localization analysis for open-shell Hartree-Fock wavefunctions. Projects molecular orbitals onto a minimal basis set (STO-3G) for chemically intuitive population analysis with output matching Gaussian 16.
 
 ## Overview
 
 MinPop provides an alternative to standard Mulliken population analysis by projecting molecular orbitals from a large extended basis onto a minimal basis set. This yields atomic charges and spin populations that are less basis-set dependent and more chemically meaningful.
+
+The method is closely related to **Pipek-Mezey localization**, which maximizes atomic Mulliken populations to produce localized orbitals. MinPop achieves similar chemical interpretability by performing Mulliken analysis in a minimal basis, where the populations are more robust and less sensitive to extended basis set size.
 
 **Supported methods:**
 - ROHF (Restricted Open-Shell Hartree-Fock)
@@ -12,14 +14,24 @@ MinPop provides an alternative to standard Mulliken population analysis by proje
 
 ## Theory
 
-The MinPop method projects MO coefficients **C** from an extended basis set onto a minimal basis using:
+The MinPop method projects MO coefficients $\mathbf{C}$ from an extended basis onto a minimal basis using:
 
 $$\mathbf{C}' = \mathbf{S}^{-1} \cdot \bar{\mathbf{S}} \cdot \mathbf{C} \cdot \mathbf{M}^{-1/2}$$
 
 where:
-- **S** is the minimal basis overlap matrix
-- **S̄** is the overlap matrix between minimal and extended basis set
-- **M** = **C**ᵀ·**S̄**ᵀ·**S**⁻¹·**S̄**·**C**, Löwdin orthogonality 
+- $\mathbf{S}$ is the minimal basis overlap matrix
+- $\bar{\mathbf{S}}$ is the cross-overlap matrix between minimal and extended basis set
+- $\mathbf{M} = \mathbf{C}^T \cdot \bar{\mathbf{S}}^T \cdot \bar{\mathbf{S}}^{-1} \cdot \bar{\mathbf{S}} \cdot \mathbf{C}$ ensures Löwdin orthonormality
+
+### Connection to Pipek-Mezey
+
+Pipek-Mezey localization finds unitary transformations that maximize the sum of squared Mulliken atomic populations:
+
+$$\xi_{PM} = \sum_A \sum_i |q_A^i|^2$$
+
+MinPop achieves a similar goal by projecting orbitals to a minimal basis where Mulliken populations are inherently more localized and chemically meaningful. Both methods leverage Mulliken's partitioning scheme but approach the problem differently:
+- **Pipek-Mezey**: Transforms orbitals to maximize atomic character
+- **MinPop**: Projects to minimal basis where atomic character is naturally enhanced
 
 ### ROHF vs UHF
 
@@ -157,9 +169,13 @@ Number     Number       Type             X           Y           Z
 
 ## References
 
+### MinPop Method
 1. Montgomery, J. A., Jr.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **1999**, *110*, 2822-2827. [DOI: 10.1063/1.477924](https://doi.org/10.1063/1.477924)
 
 2. Montgomery, J. A., Jr.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **2000**, *112*, 6532-6542. [DOI: 10.1063/1.481224](https://doi.org/10.1063/1.481224)
+
+### Related: Pipek-Mezey Localization
+3. Pipek, J.; Mezey, P. G. *J. Chem. Phys.* **1989**, *90*, 4916-4926. [DOI: 10.1063/1.456588](https://doi.org/10.1063/1.456588)
 
 ## License
 
