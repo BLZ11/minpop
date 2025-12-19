@@ -222,20 +222,21 @@ def _format_value(v):
 
 
 def _format_ao_label(idx, lbl, ao_labels):
-    """Format AO row label matching Gaussian's fixed-width format."""
+    """Format AO row label matching Gaussian's fixed-width format (23 chars)."""
     orb_str = f"{lbl[2]}{lbl[3]}"
     if idx == 0 or ao_labels[idx][0] != ao_labels[idx - 1][0]:
-        return f"{idx + 1:>4} {lbl[0] + 1:<1}   {lbl[1]:<2} {orb_str:<6}"
-    return f"{idx + 1:>4}        {orb_str:<6}"
+        return f"{idx + 1:>4} {lbl[0] + 1:<1}   {lbl[1]:<2} {orb_str:<9}"
+    return f"{idx + 1:>4}        {orb_str:<9}"
 
 
-def _print_density_matrix(dm, ao_labels, title):
+def _print_density_matrix(dm, ao_labels, title, prefix="     "):
     """Print density matrix in Gaussian's column-blocked format."""
     n, block_size = dm.shape[0], 5
-    print(f"     {title}:")
+    print(f"{prefix}{title}:")
     
     for block_start in range(0, n, block_size):
         block_end = min(block_start + block_size, n)
+        # Column headers (18 spaces prefix + 10-char columns = "1" at position 28)
         print("                  " + "".join(f"{i + 1:>10}" for i in range(block_start, block_end)))
         for i in range(block_start, n):
             cols = min(i + 1, block_end) - block_start
@@ -255,41 +256,50 @@ def _print_gross_populations(gross, ao_labels):
 def _print_atomic_matrix(matrix, mol, title):
     """Print atom-atom matrix."""
     n_atoms, block_size = mol.natm, 6
+    
     for block_start in range(0, n_atoms, block_size):
         block_end = min(block_start + block_size, n_atoms)
-        header = "        " + "".join(f"{i + 1:>12}" for i in range(block_start, block_end))
-        print(f"          MBS {title}:" if block_start == 0 else header)
-        if block_start == 0: print(header)
+        # Header (10 spaces before MBS to match Gaussian)
+        if block_start == 0:
+            print(f"          MBS {title}:")
+        # Column headers (5 spaces prefix + 11-char columns = "1" at position 16)
+        header = "     " + "".join(f"{i + 1:>11}" for i in range(block_start, block_end))
+        print(header)
         for i in range(n_atoms):
-            print(f"     {i + 1:>2}  {mol.atom_symbol(i):<2}" + 
-                  "".join(f"{matrix[i, j]:>12.6f}" for j in range(block_start, block_end)))
+            row = f"     {i + 1}  {mol.atom_symbol(i):<2}" + "".join(f"{matrix[i, j]:>11.6f}" for j in range(block_start, block_end))
+            print(row)
 
 
 def _print_mulliken_summary(charges, spins, mol):
     """Print Mulliken charges and spin densities summary."""
     print(" MBS Mulliken charges and spin densities:")
-    print("                  1          2")
+    print("     " + f"{1:>11}" + f"{2:>11}")
     for i in range(mol.natm):
-        print(f"        {i + 1}  {mol.atom_symbol(i):<2} {charges[i]:>10.6f} {spins[i]:>10.6f}")
+        print(f"     {i + 1}  {mol.atom_symbol(i):<2}{charges[i]:>11.6f}{spins[i]:>11.6f}")
     print(f" Sum of MBS Mulliken charges = {np.sum(charges):>10.5f} {np.sum(spins):>10.5f}")
 
 
 def _print_results(results, mol_min, n_doubly, n_singly):
     """Print complete MinPop analysis in Gaussian format."""
     ao_labels = results['ao_labels']
+    
+    # Header
     print(f"ROHF orbital structure: {n_doubly} doubly occupied, {n_singly} singly occupied")
     print("=" * 60)
     print("MinPop Analysis (ROHF)")
     print("=" * 60)
     
+    # Density matrices
     _print_density_matrix(results['dm_alpha'], ao_labels, "Alpha  MBS Density Matrix")
     _print_density_matrix(results['dm_beta'], ao_labels, "Beta  MBS Density Matrix")
-    _print_density_matrix(results['dm_total'], ao_labels, "Total  MBS Density Matrix")
-    _print_density_matrix(results['dm_spin'], ao_labels, "Spin  MBS Density Matrix")
+    _print_density_matrix(results['pop_total'], ao_labels, "Full MBS Mulliken population analysis", prefix="    ")
+    
+    # Population analysis
     _print_gross_populations(results['gross_orbital_pop'], ao_labels)
     _print_atomic_matrix(results['condensed_to_atoms'], mol_min, "Condensed to atoms (all electrons)")
     _print_atomic_matrix(results['spin_atomic'], mol_min, "Atomic-Atomic Spin Densities")
     _print_mulliken_summary(results['mulliken_charges'], results['spin_populations'], mol_min)
+    
     print("=" * 60)
 
 

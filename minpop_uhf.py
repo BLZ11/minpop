@@ -422,7 +422,7 @@ def _format_ao_label(idx, lbl, ao_labels):
     """
     Format AO row label matching Gaussian's fixed-width format.
     
-    Format: '   1 1   C  1S      ' (20 characters)
+    Format: '   1 1   Ti 1S         ' (23 characters total)
     """
     orb_str = f"{lbl[2]}{lbl[3]}"
     
@@ -430,22 +430,22 @@ def _format_ao_label(idx, lbl, ao_labels):
     if idx == 0 or ao_labels[idx][0] != ao_labels[idx - 1][0]:
         atom_num = lbl[0] + 1
         elem = lbl[1]
-        return f"{idx + 1:>4} {atom_num:<1}   {elem:<2} {orb_str:<6}"
+        return f"{idx + 1:>4} {atom_num:<1}   {elem:<2} {orb_str:<9}"
     else:
-        return f"{idx + 1:>4}        {orb_str:<6}"
+        return f"{idx + 1:>4}        {orb_str:<9}"
 
 
-def _print_density_matrix(dm, ao_labels, title):
+def _print_density_matrix(dm, ao_labels, title, prefix="     "):
     """Print density matrix in Gaussian's column-blocked format."""
     n = dm.shape[0]
     block_size = 5
     
-    print(f"     {title}:")
+    print(f"{prefix}{title}:")
     
     for block_start in range(0, n, block_size):
         block_end = min(block_start + block_size, n)
         
-        # Column headers
+        # Column headers (18 spaces prefix + 10-char columns = "1" at position 28)
         header = "                  " + "".join(f"{i + 1:>10}" for i in range(block_start, block_end))
         print(header)
         
@@ -469,37 +469,36 @@ def _print_gross_populations(gross, ao_labels):
         print(f"{row_label}{values}")
 
 
-def _print_atomic_matrix(matrix, mol, title, use_period=False):
+def _print_atomic_matrix(matrix, mol, title):
     """Print atom-atom matrix (condensed populations or spin densities)."""
     n_atoms = mol.natm
     block_size = 6
-    suffix = '.' if use_period else ':'
     
     for block_start in range(0, n_atoms, block_size):
         block_end = min(block_start + block_size, n_atoms)
         
-        # Header
-        header = "        " + "".join(f"{i + 1:>12}" for i in range(block_start, block_end))
-        print(f"          MBS {title}{suffix}" if block_start == 0 else header)
+        # Header (10 spaces before MBS to match Gaussian)
         if block_start == 0:
-            print(header)
+            print(f"          MBS {title}:")
+        # Column headers (5 spaces prefix + 11-char columns = "1" at position 16)
+        header = "     " + "".join(f"{i + 1:>11}" for i in range(block_start, block_end))
+        print(header)
         
         # Matrix rows
         for i in range(n_atoms):
             elem = mol.atom_symbol(i)
-            row_start = f"     {i + 1:>2}  {elem:<2}"
-            values = "".join(f"{matrix[i, j]:>12.6f}" for j in range(block_start, block_end))
-            print(f"{row_start}{values}")
+            row = f"     {i + 1}  {elem:<2}" + "".join(f"{matrix[i, j]:>11.6f}" for j in range(block_start, block_end))
+            print(row)
 
 
 def _print_mulliken_summary(charges, spins, mol):
     """Print Mulliken charges and spin densities summary."""
     print(" MBS Mulliken charges and spin densities:")
-    print("                  1          2")
+    print("     " + f"{1:>11}" + f"{2:>11}")
     
     for i in range(mol.natm):
         elem = mol.atom_symbol(i)
-        print(f"        {i + 1}  {elem:<2} {charges[i]:>10.6f} {spins[i]:>10.6f}")
+        print(f"     {i + 1}  {elem:<2}{charges[i]:>11.6f}{spins[i]:>11.6f}")
     
     total_charge = np.sum(charges)
     total_spin = np.sum(spins)
@@ -522,8 +521,7 @@ def _print_results(results, mol_min, n_alpha, n_beta):
     # Density matrices
     _print_density_matrix(results['dm_alpha'], ao_labels, "Alpha  MBS Density Matrix")
     _print_density_matrix(results['dm_beta'], ao_labels, "Beta  MBS Density Matrix")
-    _print_density_matrix(results['dm_total'], ao_labels, "Total  MBS Density Matrix")
-    _print_density_matrix(results['dm_spin'], ao_labels, "Spin  MBS Density Matrix")
+    _print_density_matrix(results['pop_total'], ao_labels, "Full MBS Mulliken population analysis", prefix="    ")
     
     # Population analysis
     _print_gross_populations(results['gross_orbital_pop'], ao_labels)
