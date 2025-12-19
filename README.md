@@ -1,64 +1,91 @@
-# MinPop: Minimum Population Localization Analysis for PySCF
+# MinPop: Minimum Population Localization Analysis
 
-A Python implementation of Minimum Population (MinPop) localization analysis for open-shell Hartree-Fock wavefunctions. Projects molecular orbitals onto a minimal basis set (STO-3G) for chemically intuitive population analysis with output matching Gaussian 16.
+**Gaussian 16-compatible population analysis for open-shell Hartree-Fock wavefunctions using PySCF**
+
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![PySCF](https://img.shields.io/badge/PySCF-2.0+-green.svg)](https://pyscf.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
 
-MinPop provides an alternative to standard Mulliken population analysis by projecting molecular orbitals from a large extended basis onto a minimal basis set. This yields atomic charges and spin populations that are less basis-set dependent and more chemically meaningful.
+MinPop projects Hartree-Fock molecular orbitals onto a chemically intuitive minimal basis set, enabling population analysis that reveals bonding character and charge distribution. This implementation produces output identical to Gaussian 16's `Pop=(Full) IOp(6/27=122,6/12=3)` keyword combination, facilitating direct comparison between codes.
 
-The method is closely related to **Pipek-Mezey localization**, which maximizes atomic Mulliken populations to produce localized orbitals. MinPop achieves similar chemical interpretability by performing Mulliken analysis in a minimal basis, where the populations are more robust and less sensitive to extended basis set size.
+### Features
 
-**Supported methods:**
-- ROHF (Restricted Open-Shell Hartree-Fock)
-- UHF (Unrestricted Hartree-Fock)
+- **UHF and ROHF support** — Handles both unrestricted and restricted open-shell wavefunctions
+- **Gaussian-compatible output** — Matches Gaussian 16's formatting for easy validation
+- **Automatic basis selection** — Follows Gaussian's convention (STO-3G, STO-3G*)
+- **Spin annihilation** — Removes first spin contaminant from UHF wavefunctions
+- **Transition metal support** — Correct handling of 3d/4s orbital ordering
 
 ## Theory
 
-The MinPop method projects MO coefficients $\mathbf{C}$ from an extended basis onto a minimal basis using:
+### The MinPop Method
 
-$$\mathbf{C}' = \mathbf{S}^{-1} \cdot \bar{\mathbf{S}} \cdot \mathbf{C} \cdot \mathbf{M}^{-1/2}$$
+The Minimum Population (MinPop) method projects extended basis set MO coefficients onto a minimal basis to obtain chemically meaningful populations. The projection is:
+
+```
+C' = S_min⁻¹ · S_cross · C · M^(-1/2)
+```
 
 where:
-- $\mathbf{S}$ is the minimal basis overlap matrix
-- $\bar{\mathbf{S}}$ is the cross-overlap matrix between minimal and extended basis set
-- $\mathbf{M} = \mathbf{C}^T \cdot \bar{\mathbf{S}}^T \cdot \bar{\mathbf{S}}^{-1} \cdot \bar{\mathbf{S}} \cdot \mathbf{C}$ ensures Löwdin orthonormality
+- **S_min** — Overlap matrix in minimal basis
+- **S_cross** — Cross-overlap ⟨minimal|extended⟩  
+- **M** — Metric matrix ensuring orthonormality
 
-### Connection to Pipek-Mezey
+### UHF vs ROHF Implementation
 
-Pipek-Mezey localization finds unitary transformations that maximize the sum of squared Mulliken atomic populations:
+The key difference between UHF and ROHF lies in how alpha and beta orbitals are treated:
 
-$$\xi_{PM} = \sum_A \sum_i |q_A^i|^2$$
+| Aspect | UHF | ROHF |
+|--------|-----|------|
+| **Spatial orbitals** | α and β have different spatial parts | α and β share same spatial functions |
+| **Projection** | Project α and β independently | Project once, partition by occupation |
+| **Spin contamination** | Present (requires annihilation) | Absent (pure spin state) |
+| **Density matrices** | D_α ≠ D_β even for paired electrons | D_α = D_β for doubly occupied |
+| **Spin density** | Scaled by S(S+1)/⟨S²⟩ | Exact (no correction needed) |
 
-MinPop achieves a similar goal by projecting orbitals to a minimal basis where Mulliken populations are inherently more localized and chemically meaningful. Both methods leverage Mulliken's partitioning scheme but approach the problem differently:
-- **Pipek-Mezey**: Transforms orbitals to maximize atomic character
-- **MinPop**: Projects to minimal basis where atomic character is naturally enhanced
+**UHF**: Alpha and beta electrons see different effective potentials, leading to different spatial wavefunctions. This introduces spin contamination that must be removed via Löwdin annihilation.
 
-### ROHF vs UHF
+**ROHF**: Doubly occupied orbitals have identical alpha and beta spatial functions. Only singly occupied orbitals contribute to spin density, giving a pure spin eigenstate.
 
-The key algorithmic difference between ROHF and UHF lies in how orbitals are projected:
+### Minimal Basis Selection
 
-| Method | Projection Strategy | Reason |
-|--------|---------------------|--------|
-| ROHF | Project all occupied orbitals **together**, then split into α/β | α and β share spatial functions |
-| UHF | Project α and β **separately** | α and β have independent spatial functions |
+Following Gaussian's convention:
+
+| Elements | Basis | d-orbitals |
+|----------|-------|------------|
+| H–Ne (1st row) | STO-3G | — |
+| Na–Ar (2nd row) | STO-3G* | Cartesian (6D) |
+| K–Xe (3rd row+) | STO-3G | Spherical (5D) |
+
+### UHF Spin Annihilation
+
+UHF wavefunctions contain spin contamination from higher spin states. The first contaminant (S+1) is removed using Löwdin's projection:
+
+```
+⟨S²⟩_after = S(S+1)
+```
+
+For singlets, the spin-annihilated spin density is exactly zero.
 
 ## Installation
 
 ### Requirements
-- Python 3.7+
+
+- Python ≥ 3.8
 - NumPy
-- SciPy
-- PySCF
+- PySCF ≥ 2.0
 
-### Install dependencies
-```bash
-pip install numpy scipy pyscf
-```
+### Install
 
-### Download
 ```bash
+# Clone repository
 git clone https://github.com/BLZ11/minpop.git
 cd minpop
+
+# Install dependencies
+pip install numpy pyscf
 ```
 
 ## Usage
@@ -66,125 +93,126 @@ cd minpop
 ### Command Line
 
 ```bash
-# ROHF analysis
-python minpop_rohf.py -xyz molecule.xyz -charge 0 -mult 3 -basis 6-31+G
+# UHF triplet calculation
+python minpop_uhf.py -xyz ch2.xyz -charge 0 -mult 3
 
-# UHF analysis
-python minpop_uhf.py -xyz molecule.xyz -charge 0 -mult 3 -basis 6-31+G
+# ROHF doublet calculation  
+python minpop_rohf.py -xyz methyl.xyz -charge 0 -mult 2
+
+# Custom basis set
+python minpop_uhf.py -xyz molecule.xyz -mult 3 -basis cc-pVDZ
 ```
-
-**Arguments:**
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `-xyz` | Path to XYZ geometry file | Required |
-| `-charge` | Molecular charge | 0 |
-| `-mult` | Spin multiplicity (2S+1) | 1 |
-| `-basis` | Computational basis set | 6-31+G |
-| `-q, --quiet` | Suppress output | False |
 
 ### Python API
 
 ```python
-from minpop_rohf import minpop_rohf, run_rohf_from_xyz
 from minpop_uhf import minpop_uhf, run_uhf_from_xyz
+from minpop_rohf import minpop_rohf, run_rohf_from_xyz
 
 # From XYZ file
-results = run_rohf_from_xyz("molecule.xyz", charge=0, multiplicity=3)
-results = run_uhf_from_xyz("molecule.xyz", charge=0, multiplicity=3)
+results = run_uhf_from_xyz("ch2.xyz", charge=0, multiplicity=3)
+print(f"Carbon charge: {results['mulliken_charges'][0]:.4f}")
+print(f"Carbon spin: {results['spin_populations'][0]:.4f}")
 
 # From existing PySCF calculation
 from pyscf import gto, scf
 
-mol = gto.M(atom='C 0 0 0; H 0 1 0; H 0 -1 0', basis='6-31+G', spin=2)
-mf = scf.ROHF(mol).run()
-results = minpop_rohf(mf)
+mol = gto.M(atom='O 0 0 0; O 0 0 1.2', basis='6-31G*', spin=2)
+mf = scf.UHF(mol).run()
+results = minpop_uhf(mf)
 ```
 
 ### Output
 
-The analysis returns a dictionary containing:
+The output format matches Gaussian 16 exactly:
+
+```
+UHF orbital structure: 5 alpha, 3 beta
+ Annihilation of the first spin contaminant:
+ S**2 before annihilation   2.0172,   after   2.0000
+============================================================
+MinPop Analysis (UHF)
+============================================================
+     Alpha  MBS Density Matrix:
+                           1         2         3         4         5
+   1 1   C  1S         1.05126
+   2        2S        -0.19228   0.77310
+   ...
+     MBS Gross orbital populations:
+                         Total     Alpha     Beta      Spin
+   1 1   C  1S         1.99596   0.99838   0.99758   0.00080
+   ...
+ MBS Mulliken charges and spin densities:
+                  1          2
+        1  C   -0.255994   2.203610
+        2  H    0.127997  -0.101805
+```
+
+## Return Values
+
+Both `minpop_uhf()` and `minpop_rohf()` return a dictionary containing:
 
 | Key | Description |
 |-----|-------------|
-| `mulliken_charges` | Atomic partial charges |
-| `spin_populations` | Atomic spin populations |
-| `dm_alpha`, `dm_beta` | Spin density matrices in minimal basis |
+| `dm_alpha`, `dm_beta` | Alpha/beta density matrices in minimal basis |
 | `dm_total`, `dm_spin` | Total and spin density matrices |
 | `gross_orbital_pop` | Per-orbital populations [total, α, β, spin] |
 | `condensed_to_atoms` | Atom-atom population matrix |
-| `spin_atomic` | Atom-atom spin density matrix |
+| `mulliken_charges` | Atomic partial charges |
+| `spin_populations` | Atomic spin densities |
 | `ao_labels` | Minimal basis AO labels |
+| `s2_before_annihilation` | ⟨S²⟩ before projection (UHF only) |
+| `s2_after_annihilation` | ⟨S²⟩ after projection (UHF only) |
 
-## Example
+## Validation
 
-### Triplet CH₂ (methylene)
+Tested against Gaussian 16 for:
 
-**Input:** `ch2.xyz`
-```
-3
+| System | Method | Elements | d-orbital type |
+|--------|--------|----------|----------------|
+| CH (quartet) | ROHF | C, H | — |
+| CH₂ (triplet) | UHF, ROHF | C, H | — |
+| CHCl₃ | ROHF | C, H, Cl | Cartesian (6D) |
+| TiO₂ | UHF, ROHF | Ti, O | Spherical (5D) |
 
-C    0.000000    0.000000    0.103184
-H    0.000000    0.995222   -0.309552
-H    0.000000   -0.995222   -0.309552
-```
+**Agreement**: Mulliken charges and spin populations match to 6 decimal places.
 
-**Command:**
-```bash
-python minpop_rohf.py -xyz ch2.xyz -charge 0 -mult 3
-```
+### Reproducing Gaussian Results
 
-**Output (excerpt):**
-```
-ROHF orbital structure: 3 doubly occupied, 2 singly occupied
-============================================================
-MinPop Analysis (ROHF)
-============================================================
-...
-MBS Mulliken charges and spin densities:
-                   1          2
-     1  C   -0.260502   1.964131
-     2  H    0.130251   0.017935
-     3  H    0.130251   0.017935
-Sum of MBS Mulliken charges =   0.00000   2.00000
-```
+For exact agreement with Gaussian's orbital-resolved density matrices, use Gaussian's **standard orientation** geometry:
 
-## Gaussian 16 Compatibility
+1. Run Gaussian with `Pop=(Full) IOp(6/27=122,6/12=3)`
+2. Extract coordinates from "Standard orientation" section
+3. Use these coordinates in your XYZ file
 
-The output format is designed to match Gaussian 16's MinPop analysis (`Pop=(Full) IOp(6/27=122,6/12=3)`). For exact numerical agreement with Gaussian's orbital-resolved output (density matrices, gross orbital populations), use Gaussian's **standard orientation** geometry in your XYZ file.
+## Comparison with Gaussian
 
-You can extract the standard orientation from Gaussian output:
-```
-Standard orientation:
----------------------------------------------------------------------
-Center     Atomic      Atomic             Coordinates (Angstroms)
-Number     Number       Type             X           Y           Z
----------------------------------------------------------------------
-     1          6           0        0.000000    0.000000    0.103184
-     2          1           0        0.000000    0.995222   -0.309552
-     3          1           0        0.000000   -0.995222   -0.309552
----------------------------------------------------------------------
-```
+### What Matches Exactly
+- ✅ Mulliken charges
+- ✅ Spin populations  
+- ✅ Gross orbital populations
+- ✅ Condensed atom-atom populations
+- ✅ S² values (before/after annihilation)
 
-**Note:** Atomic charges and spin populations are rotationally invariant and will match regardless of molecular orientation.
+### Known Differences
+- ⚠️ Density matrix elements for Cartesian d-orbitals differ by normalization factors (populations still match)
 
 ## References
 
-### MinPop Method
-1. Montgomery, J. A., Jr.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **1999**, *110*, 2822-2827. [DOI: 10.1063/1.477924](https://doi.org/10.1063/1.477924)
+1. Montgomery Jr., J. A.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **1999**, *110*, 2822–2827. [DOI: 10.1063/1.477924](https://doi.org/10.1063/1.477924)
 
-2. Montgomery, J. A., Jr.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **2000**, *112*, 6532-6542. [DOI: 10.1063/1.481224](https://doi.org/10.1063/1.481224)
+2. Montgomery Jr., J. A.; Frisch, M. J.; Ochterski, J. W.; Petersson, G. A. *J. Chem. Phys.* **2000**, *112*, 6532–6542. [DOI: 10.1063/1.481224](https://doi.org/10.1063/1.481224)
 
-### Related: Pipek-Mezey Localization
-3. Pipek, J.; Mezey, P. G. *J. Chem. Phys.* **1989**, *90*, 4916-4926. [DOI: 10.1063/1.456588](https://doi.org/10.1063/1.456588)
+3. Löwdin, P.-O. *Phys. Rev.* **1955**, *97*, 1509–1520. [DOI: 10.1103/PhysRev.97.1509](https://doi.org/10.1103/PhysRev.97.1509)
 
 ## License
 
-MIT License
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request.
+Contributions welcome! Please open an issue or pull request.
 
-## Citation
+## Authors
 
-If you use this code in your research, please cite the original MinPop references above and this repository.
+- **Barbaro Zulueta** — [GitHub](https://github.com/BLZ11)
