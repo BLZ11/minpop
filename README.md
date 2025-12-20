@@ -195,7 +195,7 @@ For exact agreement with Gaussian's orbital-resolved density matrices, use Gauss
 - ✅ S² values (before/after annihilation)
 
 ### Known Differences
-- ⚠️ Density matrix elements for Cartesian d-orbitals differ by normalization factors (populations still match)
+- ⚠️ Density matrix elements for Cartesian d-orbitals in polarization functions differ by normalization factors (populations still match)
 
 ## References
 
