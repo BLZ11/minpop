@@ -174,6 +174,7 @@ Tested against Gaussian 16 for:
 | CH₂ (triplet) | UHF, ROHF | C, H | — |
 | CHCl₃ | ROHF | C, H, Cl | Cartesian (6D) |
 | TiO₂ | UHF, ROHF | Ti, O | Spherical (5D) |
+| SnH$_4$ | ROHF | Sn, H | Spherical (5D) |
 
 **Agreement**: Mulliken charges and spin populations match to 6 decimal places.
 
