@@ -57,7 +57,7 @@ Following Gaussian's convention:
 |----------|-------|------------|
 | H–Ne (1st row) | STO-3G | — |
 | Na–Ar (2nd row) | STO-3G* | Cartesian (6D) |
-| K–Xe (3rd row+) | STO-3G | Spherical (5D) |
+| K–Xe (3rd/4th row) | STO-3G | Spherical (5D) |
 
 ### UHF Spin Annihilation
 
@@ -174,7 +174,7 @@ Tested against Gaussian 16 for:
 | CH₂ (triplet) | UHF, ROHF | C, H | — |
 | CHCl₃ | ROHF | C, H, Cl | Cartesian (6D) |
 | TiO₂ | UHF, ROHF | Ti, O | Spherical (5D) |
-| SnH$_4$ | ROHF | Sn, H | Spherical (5D) |
+| SnH₄ | ROHF | Sn, H | Spherical (5D) |
 
 **Agreement**: Mulliken charges and spin populations match to 6 decimal places.
 
