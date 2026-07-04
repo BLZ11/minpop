@@ -768,39 +768,6 @@ def _condense_to_atoms(pop_matrix, ao_labels):
     return condensed
 
 
-def _atomic_spin_from_dm(dm_spin, S_min, mol_min):
-    """Per-atom Mulliken spin populations from a minimal-basis spin density."""
-    gross = np.sum(dm_spin * S_min, axis=0)          # per-AO gross spin
-    atom_of_ao = [lbl[0] for lbl in mol_min.ao_labels(fmt=None)]
-    atomic = np.zeros(mol_min.natm)
-    for ao, a in enumerate(atom_of_ao):
-        atomic[a] += gross[ao]
-    return atomic
-
-
-def _spin_orientation_factor(dm_spin, S_min, mol_min, flip_spin=False):
-    """
-    Global sign for a broken-symmetry spin density (an Sz=0 UHF singlet is
-    doubly degenerate under alpha<->beta, so the raw sign is arbitrary).
-
-    Deterministic convention: the atom carrying the largest |spin population|
-    is made positive, giving a reproducible orientation. `flip_spin` inverts
-    it, which is useful to line up with a particular Gaussian run whose (also
-    arbitrary) sign came out the other way.
-
-    Returns +1 (keep) or -1 (swap alpha/beta and negate the spin density).
-    """
-    atomic = _atomic_spin_from_dm(dm_spin, S_min, mol_min)
-    if np.max(np.abs(atomic)) < 1e-8:
-        factor = 1.0                                  # no spin polarization
-    else:
-        ref = int(np.argmax(np.abs(atomic)))
-        factor = 1.0 if atomic[ref] >= 0 else -1.0
-    if flip_spin:
-        factor = -factor
-    return factor
-
-
 # =============================================================================
 # Output Formatting (Gaussian-Compatible)
 # =============================================================================
@@ -982,7 +949,7 @@ def _get_ecp_dict(basis, atom_str):
 # Main Analysis Functions
 # =============================================================================
 
-def minpop_uhf(mf, verbose=True, flip_spin=False):
+def minpop_uhf(mf, verbose=True):
     """
     Perform MinPop population analysis on a converged UHF calculation.
     
@@ -1048,15 +1015,10 @@ def minpop_uhf(mf, verbose=True, flip_spin=False):
     dm_total = dm_alpha + dm_beta
     # Spin density is the raw UHF D_alpha - D_beta. For a broken-symmetry singlet
     # this is nonzero (locally spin-polarized) even though the net spin integrates
-    # to zero, so it must NOT be zeroed out.
+    # to zero, so it must NOT be zeroed out. The alpha<->beta labeling of an Sz=0
+    # singlet is arbitrary, but the deterministic guess-mix reproduces Gaussian's
+    # orientation, so the raw sign is kept as-is.
     dm_spin = dm_alpha - dm_beta
-
-    # Pin the arbitrary broken-symmetry spin orientation to a reproducible sign
-    # (alpha<->beta is a degeneracy for an Sz=0 singlet). A -1 factor swaps the
-    # alpha/beta densities and flips the spin density.
-    if _spin_orientation_factor(dm_spin, S_min, mol_min, flip_spin) < 0:
-        dm_alpha, dm_beta = dm_beta, dm_alpha
-        dm_spin = -dm_spin
     
     # Mulliken population matrices
     pop_alpha = _mulliken_pop_matrix(dm_alpha, S_min)
@@ -1120,16 +1082,23 @@ def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
     """
     Broken-symmetry UHF initial guess by HOMO-LUMO mixing (Gaussian Guess=Mix).
 
-    A restricted reference (RHF for closed shell, ROHF otherwise) supplies the
-    frontier orbitals, which are rotated within the HOMO-LUMO space:
+    The *initial-guess* Fock (from the atomic-superposition / minao guess) is
+    diagonalized ONCE - without converging an SCF - and its frontier orbitals are
+    rotated within the HOMO-LUMO space:
 
         alpha_HOMO = cos(q) * phi_HOMO + sin(q) * phi_LUMO
         beta_HOMO  = cos(q) * phi_HOMO - sin(q) * phi_LUMO
 
-    (the LUMO columns are counter-rotated to keep the set orthonormal). This
-    localizes the alpha and beta densities differently and seeds a spin-broken
-    open-shell-singlet / antiferromagnetic solution. The default q = 45 degrees
-    reproduces Gaussian's Guess=Mix mixing coefficients (cos45 = sin45 = 0.7071).
+    (the LUMO columns are counter-rotated to keep the set orthonormal). The
+    default q = 45 degrees reproduces Gaussian's Guess=Mix coefficients
+    (cos45 = sin45 = 0.7071).
+
+    Mixing the *unconverged* guess is essential. If a restricted reference is
+    converged first and its HOMO/LUMO are mixed, the density starts at the
+    symmetric stationary point and DIIS relaxes straight back to it (the mixing
+    is undone). Mixing the crude guess instead - as Gaussian does - starts the
+    SCF far from that stationary point, so it descends into the broken-symmetry
+    basin on its own, usually without needing a separate stability step.
 
     Parameters
     ----------
@@ -1147,16 +1116,18 @@ def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
     """
     q = np.deg2rad(mixing_angle_deg)
 
+    # Single diagonalization of the initial-guess Fock (no SCF convergence).
     ref = scf.RHF(mol) if mol.spin == 0 else scf.ROHF(mol)
-    ref.conv_tol = 1e-9
-    ref.verbose = 0  # keep the reference SCF quiet; only the UHF result is shown
-    ref.kernel()
-    mo = ref.mo_coeff
-    occ = ref.mo_occ
+    s1e = ref.get_ovlp()
+    h1e = ref.get_hcore()
+    dm_guess = ref.get_init_guess(mol)
+    fock = ref.get_fock(h1e=h1e, s1e=s1e,
+                        vhf=ref.get_veff(mol, dm_guess), dm=dm_guess)
+    mo_energy, mo = ref.eig(fock, s1e)
 
-    occ_idx = np.where(occ > 0)[0]
-    homo = int(occ_idx[-1])
-    lumo = homo + 1
+    n_alpha, n_beta = mol.nelec
+    homo = n_alpha - 1
+    lumo = n_alpha
     if lumo >= mo.shape[1]:
         raise ValueError("Guess=Mix needs a virtual orbital, but the basis has "
                          "no LUMO for this system (fully occupied).")
@@ -1169,7 +1140,6 @@ def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
     Ca[:, lumo] = -s * phi_h + c * phi_l
     Cb[:, lumo] =  s * phi_h + c * phi_l
 
-    n_alpha, n_beta = mol.nelec
     occ_a = np.zeros(mo.shape[1]); occ_a[:n_alpha] = 1.0
     occ_b = np.zeros(mo.shape[1]); occ_b[:n_beta] = 1.0
 
@@ -1225,7 +1195,7 @@ def _stabilize_uhf(mf, max_cycles=10, verbose=False):
 def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      ecp=None, verbose=True, basis_dir=None,
                      guessmix=False, guessmix_angle=45.0,
-                     stable=False, stable_cycles=10, flip_spin=False):
+                     stable=False, stable_cycles=10):
     """
     Run UHF calculation and MinPop analysis from an XYZ file.
     
@@ -1286,7 +1256,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     # SCF with Gaussian-like defaults
     mf = scf.UHF(mol)
     mf.max_cycle = 128
-    mf.conv_tol = 1e-8
+    mf.conv_tol = 1e-9
     mf.conv_tol_grad = 1e-6
     mf.diis_space = 8
     mf.level_shift = 0.0
@@ -1301,11 +1271,20 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     # Follow internal instabilities to the lower (broken-symmetry) solution
     if stable:
         mf = _stabilize_uhf(mf, max_cycles=stable_cycles, verbose=verbose)
+
+    # Second-order (Newton) tightening. Broken-symmetry singlets sit on a very
+    # flat surface, and plain DIIS at a loose gradient leaves spin-sensitive
+    # properties (the spin density = D_alpha - D_beta) under-converged even when
+    # the energy looks converged. Newton pushes the gradient down cheaply so the
+    # MBS spin densities reproduce Gaussian.
+    mf = mf.newton()
+    mf.conv_tol = 1e-11
+    mf.kernel(mf.make_rdm1())
     
     if verbose:
         print()
     
-    return minpop_uhf(mf, verbose=verbose, flip_spin=flip_spin)
+    return minpop_uhf(mf, verbose=verbose)
 
 
 # =============================================================================
@@ -1368,11 +1347,6 @@ Notes:
     parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
                         default=10,
                         help="Max stability-follow reoptimizations (default: 10)")
-    parser.add_argument("-flip-spin", dest="flip_spin", action="store_true",
-                        help="Invert the global broken-symmetry spin orientation "
-                             "(swap alpha/beta). The Sz=0 sign is arbitrary; use "
-                             "this to line up with a Gaussian run whose sign is "
-                             "opposite")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress output")
     parser.add_argument("--version", action="version",
@@ -1391,8 +1365,7 @@ Notes:
         guessmix=args.guessmix,
         guessmix_angle=args.guessmix_angle,
         stable=args.stable,
-        stable_cycles=args.stable_cycles,
-        flip_spin=args.flip_spin
+        stable_cycles=args.stable_cycles
     )
 
 
