@@ -50,6 +50,10 @@ Author: Barbaro Zulueta (Pitt Quantum Repository)
 """
 
 import argparse
+import importlib
+import importlib.util
+import os
+import sys
 import numpy as np
 from pyscf import gto, scf
 from pyscf.gto import intor_cross
@@ -77,6 +81,128 @@ ECP_BASIS_SETS = frozenset({
 
 # Atomic number ranges for transition metals
 TRANSITION_METAL_RANGES = [(21, 30), (39, 48), (57, 80), (89, 112)]
+
+# Short labels for custom Gaussian-derived basis sets stored as PySCF dicts in
+# standalone modules (e.g. cbsb7_basis_pyscf.py defines a dict named CBSB7).
+CUSTOM_BASIS_MODULES = {
+    'cbsb3': ('cbsb3_basis_pyscf', 'CBSB3'),
+    'cbsb7': ('cbsb7_basis_pyscf', 'CBSB7'),
+}
+
+
+# =============================================================================
+# Basis Resolution (built-in names + custom PySCF-dict modules)
+# =============================================================================
+
+def _basis_search_dirs(search_dir=None):
+    """Directories to look in for custom basis modules, most specific first."""
+    dirs = []
+    if search_dir:
+        dirs.append(search_dir)
+    dirs.append(os.getcwd())
+    try:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:  # __file__ undefined in some interactive contexts
+        pass
+    # de-duplicate while preserving order
+    seen, unique = set(), []
+    for d in dirs:
+        ad = os.path.abspath(d)
+        if ad not in seen:
+            seen.add(ad)
+            unique.append(ad)
+    return unique
+
+
+def _extract_basis_dict(module, dict_name=None, hint=''):
+    """Pull the basis dict out of an imported module."""
+    if dict_name:
+        return getattr(module, dict_name)
+    # derive the conventional name from the module/file stem: cbsb7 -> CBSB7
+    guess = (hint or getattr(module, '__name__', '')).upper()
+    guess = guess.replace('_BASIS_PYSCF', '').replace('_BASIS', '')
+    if guess and hasattr(module, guess):
+        return getattr(module, guess)
+    # fall back to the first module-level dict that looks like a basis table
+    for name, val in vars(module).items():
+        if name.startswith('_') or not isinstance(val, dict) or not val:
+            continue
+        if all(isinstance(k, str) for k in val) and \
+           all(isinstance(v, list) for v in val.values()):
+            return val
+    raise ValueError(
+        f"could not find a basis dict in module {guess or module!r}; "
+        f"specify it explicitly as 'module:DICTNAME'.")
+
+
+def _load_basis_from_pyfile(path, dict_name=None):
+    """Load a basis dict from a standalone .py file given its path."""
+    path = os.path.abspath(path)
+    mod_name = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return _extract_basis_dict(module, dict_name, hint=mod_name)
+
+
+def _resolve_basis(basis, search_dir=None, dict_name=None):
+    """
+    Turn the -basis argument into something gto.M accepts.
+
+    Accepted forms:
+      * a dict                 -> returned unchanged (already a PySCF basis)
+      * 'cbsb3' / 'cbsb7'      -> loads CBSB3/CBSB7 from <name>_basis_pyscf.py
+      * a path to a .py file   -> loads the basis dict from that file
+      * 'module:DICTNAME'      -> imports the module, returns its DICTNAME attr
+      * any other string       -> returned unchanged (standard PySCF basis name)
+
+    Custom basis modules are searched for in search_dir, the current working
+    directory, and the directory holding this script (in that order).
+    """
+    if not isinstance(basis, str):
+        return basis  # dict (or other object) passed programmatically
+
+    for d in _basis_search_dirs(search_dir):
+        if d not in sys.path:
+            sys.path.insert(0, d)
+
+    spec = basis.strip()
+
+    # explicit "module:DICTNAME"
+    if ':' in spec and not spec.lower().endswith('.py'):
+        mod_name, _, dname = spec.partition(':')
+        module = importlib.import_module(mod_name)
+        return _extract_basis_dict(module, dname or dict_name, hint=mod_name)
+
+    # path to a .py file
+    if spec.lower().endswith('.py') and os.path.exists(spec):
+        return _load_basis_from_pyfile(spec, dict_name)
+
+    # known short label (case/dash/underscore-insensitive)
+    key = spec.lower().replace('-', '').replace('_', '')
+    if key in CUSTOM_BASIS_MODULES:
+        mod_name, dname = CUSTOM_BASIS_MODULES[key]
+        try:
+            module = importlib.import_module(mod_name)
+        except ImportError as exc:
+            raise ImportError(
+                f"basis '{spec}' requires the module '{mod_name}.py' to be "
+                f"importable (place it in the current directory, next to this "
+                f"script, or pass -basis-dir). Original error: {exc}")
+        return _extract_basis_dict(module, dict_name or dname, hint=mod_name)
+
+    # standard basis name (e.g. '6-31+G', 'cc-pVDZ', 'def2-TZVPP')
+    return basis
+
+
+def _basis_label(basis):
+    """Human-readable label for a resolved-or-unresolved basis argument."""
+    if isinstance(basis, str):
+        return basis
+    if isinstance(basis, dict):
+        return f"custom dict ({len(basis)} elements)"
+    return repr(basis)
+
 
 
 # =============================================================================
@@ -257,6 +383,129 @@ def _lowdin_annihilate(dm_spin_raw, S_min, n_alpha, n_beta):
         scale = 1.0
     
     return dm_spin_raw * scale, scale
+
+
+def _annihilate_first_contaminant(mo_a, mo_b, S, n_a, n_b,
+                                  tol=5e-4, max_pairs=6):
+    """
+    ⟨S²⟩ before and after Löwdin annihilation of the first spin contaminant.
+
+    Reproduces Gaussian's "S**2 before/after annihilation". The contamination is
+    read from the corresponding-orbital overlaps (singular values of the alpha-
+    beta MO overlap): each pair with overlap λ contributes a spin defect
+    t = 1 - λ² and behaves as a mix of a singlet and a triplet (Ms=0) component.
+
+    ⟨S²⟩ before is exact: Sz(Sz+1) + Σ t_i. For the "after" value the same single
+    Löwdin annihilator A = (Ŝ² - (Sz+1)(Sz+2)) / (Sz(Sz+1) - (Sz+1)(Sz+2)) that
+    Gaussian applies is evaluated as ⟨AΨ|Ŝ²|AΨ⟩ / ⟨AΨ|AΨ⟩, which needs the spin
+    moments ⟨Ŝ²⟩, ⟨Ŝ⁴⟩, ⟨Ŝ⁶⟩ of the determinant.
+
+    For a broken-symmetry singlet (Sz = 0) these moments have exact closed forms
+    in the pair spin defects t_i = 1 - λ_i² (A = Σt, B = Σt², C = Σt³):
+        ⟨Ŝ²⟩ = A
+        ⟨Ŝ⁴⟩ = 2A + 2A² - 2B
+        ⟨Ŝ⁶⟩ = 4A + 16A² + 6A³ - 16B - 18AB + 12C
+    so every pair (including weakly broken ones, which carry the higher-multiplet
+    content the "after" value is sensitive to) is included with no truncation.
+    For higher multiplicities (Sz > 0) the strongly broken pairs are coupled
+    explicitly with the Sz-core and the same annihilator is applied.
+
+    Parameters
+    ----------
+    mo_a, mo_b : ndarray
+        Occupied alpha / beta MO coefficients (in the basis of overlap S).
+    S : ndarray
+        AO overlap matrix for those coefficients.
+    n_a, n_b : int
+        Numbers of alpha and beta electrons.
+    tol : float, optional
+        Minimum spin defect for a pair to be coupled explicitly, used only for
+        the Sz > 0 path (default 5e-4).
+    max_pairs : int, optional
+        Cap on explicitly coupled pairs for the Sz > 0 path (default 6).
+
+    Returns
+    -------
+    (s2_before, s2_after) : tuple of float
+    """
+    Sz = (n_a - n_b) / 2.0
+    Delta = mo_a.T @ S @ mo_b
+    sv = np.linalg.svd(Delta, compute_uv=False)
+    lam2 = np.clip(sv ** 2, 0.0, 1.0)
+    t = 1.0 - lam2                      # per-pair spin defect
+    s2_before = Sz * (Sz + 1) + float(t.sum())
+
+    a = Sz * (Sz + 1)            # target eigenvalue
+    b = (Sz + 1) * (Sz + 2)      # first contaminant eigenvalue
+
+    if t.sum() < 1e-12:
+        return s2_before, a         # no contamination to annihilate
+
+    # -- Singlet: exact closed-form moments over ALL pairs (matches Gaussian) --
+    if abs(Sz) < 1e-9:
+        A = float(t.sum()); B = float((t ** 2).sum()); C = float((t ** 3).sum())
+        s2 = A
+        s4 = 2 * A + 2 * A ** 2 - 2 * B
+        s6 = 4 * A + 16 * A ** 2 + 6 * A ** 3 - 16 * B - 18 * A * B + 12 * C
+        s2_after = (s6 - 2 * b * s4 + b * b * s2) / (s4 - 2 * b * s2 + b * b)
+        return s2_before, float(s2_after)
+
+    # -- Sz > 0: couple strongly broken pairs with the Sz-core, apply annihilator --
+    sig = np.sort(t[t > tol])[::-1][:max_pairs]
+    if sig.size == 0:
+        return s2_before, a
+
+    def _spin_ops(two_s):
+        d = two_s + 1
+        ms = np.array([two_s / 2.0 - i for i in range(d)])
+        sz = np.diag(ms)
+        sp = np.zeros((d, d))
+        for i in range(1, d):
+            m = ms[i]
+            sp[i - 1, i] = np.sqrt((two_s / 2.0) * (two_s / 2.0 + 1) - m * (m + 1))
+        return sz, sp
+
+    ops_z, ops_p, vecs = [], [], []
+    two_s_core = int(round(2 * Sz))
+    cz, cp = _spin_ops(two_s_core)
+    ops_z.append(cz); ops_p.append(cp)
+    cvec = np.zeros(two_s_core + 1); cvec[0] = 1.0
+    vecs.append(cvec)
+    sq2 = np.sqrt(2.0)
+    pair_z = np.diag([0.0, -1.0, 0.0, 1.0])
+    pair_p = np.zeros((4, 4)); pair_p[2, 1] = sq2; pair_p[3, 2] = sq2
+    for ti in sig:
+        qi = ti / 2.0
+        ops_z.append(pair_z); ops_p.append(pair_p)
+        v = np.zeros(4); v[0] = np.sqrt(max(1 - qi, 0.0)); v[2] = np.sqrt(qi)
+        vecs.append(v)
+
+    def _kron(mats):
+        out = np.array([[1.0]])
+        for m in mats:
+            out = np.kron(out, m)
+        return out
+
+    dims = [o.shape[0] for o in ops_z]
+    n_sub = len(ops_z)
+    Sz_tot = np.zeros((int(np.prod(dims)),) * 2)
+    Sp_tot = np.zeros_like(Sz_tot)
+    for i in range(n_sub):
+        mats = [np.eye(dims[j]) for j in range(n_sub)]; mats[i] = ops_z[i]
+        Sz_tot += _kron(mats)
+        mats = [np.eye(dims[j]) for j in range(n_sub)]; mats[i] = ops_p[i]
+        Sp_tot += _kron(mats)
+    S2 = Sz_tot @ Sz_tot + 0.5 * (Sp_tot @ Sp_tot.T + Sp_tot.T @ Sp_tot)
+
+    psi = np.array([1.0])
+    for v in vecs:
+        psi = np.kron(psi, v)
+    psi /= np.linalg.norm(psi)
+
+    Aop = (S2 - b * np.eye(S2.shape[0])) / (a - b)
+    Apsi = Aop @ psi
+    s2_after = float((Apsi @ S2 @ Apsi) / (Apsi @ Apsi))
+    return s2_before, s2_after
 
 
 # =============================================================================
@@ -519,6 +768,39 @@ def _condense_to_atoms(pop_matrix, ao_labels):
     return condensed
 
 
+def _atomic_spin_from_dm(dm_spin, S_min, mol_min):
+    """Per-atom Mulliken spin populations from a minimal-basis spin density."""
+    gross = np.sum(dm_spin * S_min, axis=0)          # per-AO gross spin
+    atom_of_ao = [lbl[0] for lbl in mol_min.ao_labels(fmt=None)]
+    atomic = np.zeros(mol_min.natm)
+    for ao, a in enumerate(atom_of_ao):
+        atomic[a] += gross[ao]
+    return atomic
+
+
+def _spin_orientation_factor(dm_spin, S_min, mol_min, flip_spin=False):
+    """
+    Global sign for a broken-symmetry spin density (an Sz=0 UHF singlet is
+    doubly degenerate under alpha<->beta, so the raw sign is arbitrary).
+
+    Deterministic convention: the atom carrying the largest |spin population|
+    is made positive, giving a reproducible orientation. `flip_spin` inverts
+    it, which is useful to line up with a particular Gaussian run whose (also
+    arbitrary) sign came out the other way.
+
+    Returns +1 (keep) or -1 (swap alpha/beta and negate the spin density).
+    """
+    atomic = _atomic_spin_from_dm(dm_spin, S_min, mol_min)
+    if np.max(np.abs(atomic)) < 1e-8:
+        factor = 1.0                                  # no spin polarization
+    else:
+        ref = int(np.argmax(np.abs(atomic)))
+        factor = 1.0 if atomic[ref] >= 0 else -1.0
+    if flip_spin:
+        factor = -factor
+    return factor
+
+
 # =============================================================================
 # Output Formatting (Gaussian-Compatible)
 # =============================================================================
@@ -592,8 +874,8 @@ def _print_atomic_matrix(matrix, mol, title):
     n = mol.natm
     print(f"          MBS {title}:")
     
-    for col_start in range(0, n, 5):
-        col_end = min(col_start + 5, n)
+    for col_start in range(0, n, 6):
+        col_end = min(col_start + 6, n)
         
         # Header: 5 spaces + column numbers in 11-char fields
         header = " " * 5 + "".join(f"{c+1:11d}" for c in range(col_start, col_end))
@@ -700,7 +982,7 @@ def _get_ecp_dict(basis, atom_str):
 # Main Analysis Functions
 # =============================================================================
 
-def minpop_uhf(mf, verbose=True):
+def minpop_uhf(mf, verbose=True, flip_spin=False):
     """
     Perform MinPop population analysis on a converged UHF calculation.
     
@@ -752,20 +1034,29 @@ def minpop_uhf(mf, verbose=True):
     mo_alpha = _project_to_minimal_basis(mo_coeff_a[:, :n_alpha], S_cross, S_min_inv)
     mo_beta = _project_to_minimal_basis(mo_coeff_b[:, :n_beta], S_cross, S_min_inv)
     
-    # Compute S² before annihilation
-    s2_before = _compute_s2(mo_alpha, mo_beta, S_min)
+    # ⟨S²⟩ before/after annihilation from the FULL wavefunction. Gaussian reports
+    # the full-basis values here (not the minimal-basis projection), and single
+    # Löwdin annihilation leaves residual higher contaminants (so "after" is not
+    # the ideal S(S+1) for a spin-broken singlet).
+    S_full = mol.intor('int1e_ovlp')
+    s2_before, s2_after = _annihilate_first_contaminant(
+        mo_coeff_a[:, :n_alpha], mo_coeff_b[:, :n_beta], S_full, n_alpha, n_beta)
     
     # Build density matrices
     dm_alpha = mo_alpha @ mo_alpha.T
     dm_beta = mo_beta @ mo_beta.T
     dm_total = dm_alpha + dm_beta
-    dm_spin_raw = dm_alpha - dm_beta
-    
-    # Apply Löwdin spin annihilation
-    dm_spin, _ = _lowdin_annihilate(dm_spin_raw, S_min, n_alpha, n_beta)
-    
-    S_target = (n_alpha - n_beta) / 2.0
-    s2_after = S_target * (S_target + 1)
+    # Spin density is the raw UHF D_alpha - D_beta. For a broken-symmetry singlet
+    # this is nonzero (locally spin-polarized) even though the net spin integrates
+    # to zero, so it must NOT be zeroed out.
+    dm_spin = dm_alpha - dm_beta
+
+    # Pin the arbitrary broken-symmetry spin orientation to a reproducible sign
+    # (alpha<->beta is a degeneracy for an Sz=0 singlet). A -1 factor swaps the
+    # alpha/beta densities and flips the spin density.
+    if _spin_orientation_factor(dm_spin, S_min, mol_min, flip_spin) < 0:
+        dm_alpha, dm_beta = dm_beta, dm_alpha
+        dm_spin = -dm_spin
     
     # Mulliken population matrices
     pop_alpha = _mulliken_pop_matrix(dm_alpha, S_min)
@@ -825,8 +1116,116 @@ def minpop_uhf(mf, verbose=True):
     return results
 
 
+def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
+    """
+    Broken-symmetry UHF initial guess by HOMO-LUMO mixing (Gaussian Guess=Mix).
+
+    A restricted reference (RHF for closed shell, ROHF otherwise) supplies the
+    frontier orbitals, which are rotated within the HOMO-LUMO space:
+
+        alpha_HOMO = cos(q) * phi_HOMO + sin(q) * phi_LUMO
+        beta_HOMO  = cos(q) * phi_HOMO - sin(q) * phi_LUMO
+
+    (the LUMO columns are counter-rotated to keep the set orthonormal). This
+    localizes the alpha and beta densities differently and seeds a spin-broken
+    open-shell-singlet / antiferromagnetic solution. The default q = 45 degrees
+    reproduces Gaussian's Guess=Mix mixing coefficients (cos45 = sin45 = 0.7071).
+
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        Target molecule (charge and spin already set).
+    mixing_angle_deg : float, optional
+        HOMO-LUMO mixing angle in degrees (default: 45).
+    verbose : bool, optional
+        Print a one-line note about the mixing (default: False).
+
+    Returns
+    -------
+    dm0 : ndarray
+        Broken-symmetry (alpha, beta) initial density matrix for scf.UHF.
+    """
+    q = np.deg2rad(mixing_angle_deg)
+
+    ref = scf.RHF(mol) if mol.spin == 0 else scf.ROHF(mol)
+    ref.conv_tol = 1e-9
+    ref.verbose = 0  # keep the reference SCF quiet; only the UHF result is shown
+    ref.kernel()
+    mo = ref.mo_coeff
+    occ = ref.mo_occ
+
+    occ_idx = np.where(occ > 0)[0]
+    homo = int(occ_idx[-1])
+    lumo = homo + 1
+    if lumo >= mo.shape[1]:
+        raise ValueError("Guess=Mix needs a virtual orbital, but the basis has "
+                         "no LUMO for this system (fully occupied).")
+
+    Ca, Cb = mo.copy(), mo.copy()
+    c, s = np.cos(q), np.sin(q)
+    phi_h, phi_l = mo[:, homo].copy(), mo[:, lumo].copy()
+    Ca[:, homo] =  c * phi_h + s * phi_l
+    Cb[:, homo] =  c * phi_h - s * phi_l
+    Ca[:, lumo] = -s * phi_h + c * phi_l
+    Cb[:, lumo] =  s * phi_h + c * phi_l
+
+    n_alpha, n_beta = mol.nelec
+    occ_a = np.zeros(mo.shape[1]); occ_a[:n_alpha] = 1.0
+    occ_b = np.zeros(mo.shape[1]); occ_b[:n_beta] = 1.0
+
+    if verbose:
+        print(f"Guess=Mix: rotating HOMO (MO {homo+1}) with LUMO (MO {lumo+1}) "
+              f"by {mixing_angle_deg:g} deg to break spin symmetry")
+
+    return scf.uhf.make_rdm1((Ca, Cb), (occ_a, occ_b))
+
+
+def _stabilize_uhf(mf, max_cycles=10, verbose=False):
+    """
+    Follow internal UHF instabilities until the solution is internally stable
+    (analogous to Gaussian's Stable=Opt).
+
+    A HOMO-LUMO mixed guess seeds a broken-symmetry state, but plain DIIS can
+    relax back to the symmetric solution. This repeatedly runs the internal
+    stability analysis and, whenever an instability is found, rotates along it
+    and reconverges, descending to the genuine (often broken-symmetry) minimum.
+
+    Parameters
+    ----------
+    mf : pyscf.scf.uhf.UHF
+        A converged UHF mean-field object.
+    max_cycles : int, optional
+        Maximum stability-follow reoptimizations (default: 10).
+    verbose : bool, optional
+        Print progress (default: False).
+
+    Returns
+    -------
+    mf : pyscf.scf.uhf.UHF
+        UHF object at an internally stable solution (or the last one reached).
+    """
+    for i in range(1, max_cycles + 1):
+        mo1, _, stable_i, _ = mf.stability(return_status=True)
+        if stable_i:
+            if verbose and i > 1:
+                print(f"Stable=Opt: internally stable after "
+                      f"{i - 1} reoptimization(s)")
+            return mf
+        if verbose:
+            print(f"Stable=Opt: internal instability found; reoptimizing "
+                  f"(cycle {i})")
+        dm1 = mf.make_rdm1(mo1, mf.mo_occ)
+        mf.kernel(dm0=dm1)
+    if verbose:
+        print(f"Stable=Opt: WARNING still internally unstable after "
+              f"{max_cycles} cycles")
+    return mf
+
+
 def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
-                     ecp=None, verbose=True):
+                     ecp=None, verbose=True, basis_dir=None,
+                     guessmix=False, guessmix_angle=45.0,
+                     stable=False, stable_cycles=10, flip_spin=False):
     """
     Run UHF calculation and MinPop analysis from an XYZ file.
     
@@ -857,16 +1256,21 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     >>> print(f"Carbon spin: {results['spin_populations'][0]:.4f}")
     """
     atom_str = _read_xyz(xyz_file)
-    
-    # Auto-detect ECP for heavy elements
-    if ecp is None:
-        ecp = _get_ecp_dict(basis, atom_str)
+
+    # Resolve the computational basis: a standard name is passed through, while
+    # 'cbsb3'/'cbsb7' (or a .py path / 'module:DICT') is loaded as a PySCF dict.
+    basis_obj = _resolve_basis(basis, search_dir=basis_dir)
+
+    # Auto-detect ECP for heavy elements (only meaningful for named basis sets;
+    # the custom CBSB3/CBSB7 dicts cover H-Ar and never need an ECP).
+    if ecp is None and isinstance(basis_obj, str):
+        ecp = _get_ecp_dict(basis_obj, atom_str)
         if ecp and verbose:
             print(f"Auto-detected ECP for heavy elements: {ecp}")
     
     mol = gto.M(
         atom=atom_str,
-        basis=basis,
+        basis=basis_obj,
         charge=charge,
         spin=multiplicity - 1,
         ecp=ecp
@@ -875,7 +1279,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose:
         print(f"Molecule: {xyz_file}")
         print(f"Charge: {charge}, Multiplicity: {multiplicity}")
-        print(f"Basis: {basis}")
+        print(f"Basis: {_basis_label(basis_obj)}")
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
         print()
     
@@ -886,12 +1290,22 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     mf.conv_tol_grad = 1e-6
     mf.diis_space = 8
     mf.level_shift = 0.0
-    mf.kernel()
+
+    # Optional broken-symmetry HOMO-LUMO mixed initial guess (Gaussian Guess=Mix)
+    dm0 = None
+    if guessmix:
+        dm0 = _init_guess_mixed(mol, mixing_angle_deg=guessmix_angle,
+                                verbose=verbose)
+    mf.kernel(dm0=dm0)
+
+    # Follow internal instabilities to the lower (broken-symmetry) solution
+    if stable:
+        mf = _stabilize_uhf(mf, max_cycles=stable_cycles, verbose=verbose)
     
     if verbose:
         print()
     
-    return minpop_uhf(mf, verbose=verbose)
+    return minpop_uhf(mf, verbose=verbose, flip_spin=flip_spin)
 
 
 # =============================================================================
@@ -907,11 +1321,20 @@ def main():
 Examples:
   python minpop_uhf.py -xyz ch2.xyz -charge 0 -mult 3
   python minpop_uhf.py -xyz radical.xyz -mult 2 -basis cc-pVDZ
-  python minpop_uhf.py -xyz snh4.xyz -basis def2-TZVPP  # Auto-detects ECP
+  python minpop_uhf.py -xyz snh4.xyz -basis def2-TZVPP     # Auto-detects ECP
+  python minpop_uhf.py -xyz ch2.xyz -mult 3 -basis cbsb7   # Gaussian CBSB7 (H-Ar)
+  python minpop_uhf.py -xyz ch2.xyz -mult 3 -basis cbsb3 -basis-dir ./basis
+  python minpop_uhf.py -xyz singlet_diradical.xyz -mult 1 -guessmix -stable  # broken-symmetry
 
 Notes:
   Output matches Gaussian 16's Pop=(Full) IOp(6/27=122,6/12=3) format.
   ECP auto-detected for def2 basis sets with heavy elements (Z > 36).
+  For open-shell-singlet / antiferromagnetic states use -guessmix (Gaussian
+  Guess=Mix) together with -stable (Gaussian Stable=Opt): the mix seeds the
+  broken-symmetry state and -stable keeps DIIS from relaxing back to symmetric.
+  -basis accepts a standard name, 'cbsb3'/'cbsb7', a path to a *_basis_pyscf.py
+  file, or 'module:DICTNAME'. Custom modules are found in -basis-dir, the current
+  directory, or next to this script.
 """
     )
     parser.add_argument("-xyz", required=True, dest="xyz_file",
@@ -921,9 +1344,35 @@ Notes:
     parser.add_argument("-mult", type=int, default=1,
                         help="Spin multiplicity 2S+1 (default: 1)")
     parser.add_argument("-basis", default="6-31+G",
-                        help="Computational basis set (default: 6-31+G)")
+                        help="Computational basis: a standard name (e.g. cc-pVDZ), "
+                             "'cbsb3'/'cbsb7', a path to a *_basis_pyscf.py file, "
+                             "or 'module:DICTNAME' (default: 6-31+G)")
+    parser.add_argument("-basis-dir", dest="basis_dir", default=None,
+                        help="Directory to search for custom basis modules "
+                             "(cbsb3_basis_pyscf.py / cbsb7_basis_pyscf.py)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
+    parser.add_argument("-guessmix", action="store_true",
+                        help="Break spin symmetry via a HOMO-LUMO mixed initial "
+                             "guess (Gaussian Guess=Mix) for open-shell singlets / "
+                             "antiferromagnetic broken-symmetry states")
+    parser.add_argument("-guessmix-angle", dest="guessmix_angle", type=float,
+                        default=45.0,
+                        help="HOMO-LUMO mixing angle in degrees (default: 45, "
+                             "matching Gaussian's 0.7071 coefficients)")
+    parser.add_argument("-stable", action="store_true",
+                        help="Follow internal UHF instabilities to the lower "
+                             "solution (Gaussian Stable=Opt); needed to keep a "
+                             "broken-symmetry state that DIIS would otherwise "
+                             "relax back to the symmetric solution")
+    parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
+                        default=10,
+                        help="Max stability-follow reoptimizations (default: 10)")
+    parser.add_argument("-flip-spin", dest="flip_spin", action="store_true",
+                        help="Invert the global broken-symmetry spin orientation "
+                             "(swap alpha/beta). The Sz=0 sign is arbitrary; use "
+                             "this to line up with a Gaussian run whose sign is "
+                             "opposite")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress output")
     parser.add_argument("--version", action="version",
@@ -937,7 +1386,13 @@ Notes:
         multiplicity=args.mult,
         basis=args.basis,
         ecp=args.ecp,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        basis_dir=args.basis_dir,
+        guessmix=args.guessmix,
+        guessmix_angle=args.guessmix_angle,
+        stable=args.stable,
+        stable_cycles=args.stable_cycles,
+        flip_spin=args.flip_spin
     )
 
 

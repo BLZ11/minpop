@@ -44,6 +44,10 @@ Author: Barbaro Zulueta (Pitt Quantum Repository)
 """
 
 import argparse
+import importlib
+import importlib.util
+import os
+import sys
 import numpy as np
 from pyscf import gto, scf
 from pyscf.gto import intor_cross
@@ -71,6 +75,128 @@ ECP_BASIS_SETS = frozenset({
 
 # Atomic number ranges for transition metals
 TRANSITION_METAL_RANGES = [(21, 30), (39, 48), (57, 80), (89, 112)]
+
+# Short labels for custom Gaussian-derived basis sets stored as PySCF dicts in
+# standalone modules (e.g. cbsb7_basis_pyscf.py defines a dict named CBSB7).
+CUSTOM_BASIS_MODULES = {
+    'cbsb3': ('cbsb3_basis_pyscf', 'CBSB3'),
+    'cbsb7': ('cbsb7_basis_pyscf', 'CBSB7'),
+}
+
+
+# =============================================================================
+# Basis Resolution (built-in names + custom PySCF-dict modules)
+# =============================================================================
+
+def _basis_search_dirs(search_dir=None):
+    """Directories to look in for custom basis modules, most specific first."""
+    dirs = []
+    if search_dir:
+        dirs.append(search_dir)
+    dirs.append(os.getcwd())
+    try:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:  # __file__ undefined in some interactive contexts
+        pass
+    # de-duplicate while preserving order
+    seen, unique = set(), []
+    for d in dirs:
+        ad = os.path.abspath(d)
+        if ad not in seen:
+            seen.add(ad)
+            unique.append(ad)
+    return unique
+
+
+def _extract_basis_dict(module, dict_name=None, hint=''):
+    """Pull the basis dict out of an imported module."""
+    if dict_name:
+        return getattr(module, dict_name)
+    # derive the conventional name from the module/file stem: cbsb7 -> CBSB7
+    guess = (hint or getattr(module, '__name__', '')).upper()
+    guess = guess.replace('_BASIS_PYSCF', '').replace('_BASIS', '')
+    if guess and hasattr(module, guess):
+        return getattr(module, guess)
+    # fall back to the first module-level dict that looks like a basis table
+    for name, val in vars(module).items():
+        if name.startswith('_') or not isinstance(val, dict) or not val:
+            continue
+        if all(isinstance(k, str) for k in val) and \
+           all(isinstance(v, list) for v in val.values()):
+            return val
+    raise ValueError(
+        f"could not find a basis dict in module {guess or module!r}; "
+        f"specify it explicitly as 'module:DICTNAME'.")
+
+
+def _load_basis_from_pyfile(path, dict_name=None):
+    """Load a basis dict from a standalone .py file given its path."""
+    path = os.path.abspath(path)
+    mod_name = os.path.splitext(os.path.basename(path))[0]
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return _extract_basis_dict(module, dict_name, hint=mod_name)
+
+
+def _resolve_basis(basis, search_dir=None, dict_name=None):
+    """
+    Turn the -basis argument into something gto.M accepts.
+
+    Accepted forms:
+      * a dict                 -> returned unchanged (already a PySCF basis)
+      * 'cbsb3' / 'cbsb7'      -> loads CBSB3/CBSB7 from <name>_basis_pyscf.py
+      * a path to a .py file   -> loads the basis dict from that file
+      * 'module:DICTNAME'      -> imports the module, returns its DICTNAME attr
+      * any other string       -> returned unchanged (standard PySCF basis name)
+
+    Custom basis modules are searched for in search_dir, the current working
+    directory, and the directory holding this script (in that order).
+    """
+    if not isinstance(basis, str):
+        return basis  # dict (or other object) passed programmatically
+
+    for d in _basis_search_dirs(search_dir):
+        if d not in sys.path:
+            sys.path.insert(0, d)
+
+    spec = basis.strip()
+
+    # explicit "module:DICTNAME"
+    if ':' in spec and not spec.lower().endswith('.py'):
+        mod_name, _, dname = spec.partition(':')
+        module = importlib.import_module(mod_name)
+        return _extract_basis_dict(module, dname or dict_name, hint=mod_name)
+
+    # path to a .py file
+    if spec.lower().endswith('.py') and os.path.exists(spec):
+        return _load_basis_from_pyfile(spec, dict_name)
+
+    # known short label (case/dash/underscore-insensitive)
+    key = spec.lower().replace('-', '').replace('_', '')
+    if key in CUSTOM_BASIS_MODULES:
+        mod_name, dname = CUSTOM_BASIS_MODULES[key]
+        try:
+            module = importlib.import_module(mod_name)
+        except ImportError as exc:
+            raise ImportError(
+                f"basis '{spec}' requires the module '{mod_name}.py' to be "
+                f"importable (place it in the current directory, next to this "
+                f"script, or pass -basis-dir). Original error: {exc}")
+        return _extract_basis_dict(module, dict_name or dname, hint=mod_name)
+
+    # standard basis name (e.g. '6-31+G', 'cc-pVDZ', 'def2-TZVPP')
+    return basis
+
+
+def _basis_label(basis):
+    """Human-readable label for a resolved-or-unresolved basis argument."""
+    if isinstance(basis, str):
+        return basis
+    if isinstance(basis, dict):
+        return f"custom dict ({len(basis)} elements)"
+    return repr(basis)
+
 
 
 # =============================================================================
@@ -529,8 +655,8 @@ def _print_atomic_matrix(matrix, mol, title):
     n = mol.natm
     print(f"          MBS {title}:")
     
-    for col_start in range(0, n, 5):
-        col_end = min(col_start + 5, n)
+    for col_start in range(0, n, 6):
+        col_end = min(col_start + 6, n)
         
         # Header: 5 spaces + column numbers in 11-char fields
         header = " " * 5 + "".join(f"{c+1:11d}" for c in range(col_start, col_end))
@@ -756,7 +882,7 @@ def minpop_rohf(mf, verbose=True):
 
 
 def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
-                      ecp=None, verbose=True):
+                      ecp=None, verbose=True, basis_dir=None):
     """
     Run ROHF calculation and MinPop analysis from an XYZ file.
     
@@ -787,16 +913,21 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     >>> print(f"Carbon spin: {results['spin_populations'][0]:.4f}")
     """
     atom_str = _read_xyz(xyz_file)
-    
-    # Auto-detect ECP for heavy elements
-    if ecp is None:
-        ecp = _get_ecp_dict(basis, atom_str)
+
+    # Resolve the computational basis: a standard name is passed through, while
+    # 'cbsb3'/'cbsb7' (or a .py path / 'module:DICT') is loaded as a PySCF dict.
+    basis_obj = _resolve_basis(basis, search_dir=basis_dir)
+
+    # Auto-detect ECP for heavy elements (only meaningful for named basis sets;
+    # the custom CBSB3/CBSB7 dicts cover H-Ar and never need an ECP).
+    if ecp is None and isinstance(basis_obj, str):
+        ecp = _get_ecp_dict(basis_obj, atom_str)
         if ecp and verbose:
             print(f"Auto-detected ECP for heavy elements: {ecp}")
     
     mol = gto.M(
         atom=atom_str,
-        basis=basis,
+        basis=basis_obj,
         charge=charge,
         spin=multiplicity - 1,
         ecp=ecp
@@ -805,7 +936,7 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose:
         print(f"Molecule: {xyz_file}")
         print(f"Charge: {charge}, Multiplicity: {multiplicity}")
-        print(f"Basis: {basis}")
+        print(f"Basis: {_basis_label(basis_obj)}")
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
         print()
     
@@ -837,11 +968,16 @@ def main():
 Examples:
   python minpop_rohf.py -xyz ch2.xyz -charge 0 -mult 3
   python minpop_rohf.py -xyz radical.xyz -mult 2 -basis cc-pVDZ
-  python minpop_rohf.py -xyz snh4.xyz -basis def2-TZVPP  # Auto-detects ECP
+  python minpop_rohf.py -xyz snh4.xyz -basis def2-TZVPP     # Auto-detects ECP
+  python minpop_rohf.py -xyz ch2.xyz -mult 3 -basis cbsb7   # Gaussian CBSB7 (H-Ar)
+  python minpop_rohf.py -xyz ch2.xyz -mult 3 -basis cbsb3 -basis-dir ./basis
 
 Notes:
   Output matches Gaussian 16's Pop=(Full) IOp(6/27=122,6/12=3) format.
   ECP auto-detected for def2 basis sets with heavy elements (Z > 36).
+  -basis accepts a standard name, 'cbsb3'/'cbsb7', a path to a *_basis_pyscf.py
+  file, or 'module:DICTNAME'. Custom modules are found in -basis-dir, the current
+  directory, or next to this script.
 """
     )
     parser.add_argument("-xyz", required=True, dest="xyz_file",
@@ -851,7 +987,12 @@ Notes:
     parser.add_argument("-mult", type=int, default=1,
                         help="Spin multiplicity 2S+1 (default: 1)")
     parser.add_argument("-basis", default="6-31+G",
-                        help="Computational basis set (default: 6-31+G)")
+                        help="Computational basis: a standard name (e.g. cc-pVDZ), "
+                             "'cbsb3'/'cbsb7', a path to a *_basis_pyscf.py file, "
+                             "or 'module:DICTNAME' (default: 6-31+G)")
+    parser.add_argument("-basis-dir", dest="basis_dir", default=None,
+                        help="Directory to search for custom basis modules "
+                             "(cbsb3_basis_pyscf.py / cbsb7_basis_pyscf.py)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -867,7 +1008,8 @@ Notes:
         multiplicity=args.mult,
         basis=args.basis,
         ecp=args.ecp,
-        verbose=not args.quiet
+        verbose=not args.quiet,
+        basis_dir=args.basis_dir
     )
 
 
