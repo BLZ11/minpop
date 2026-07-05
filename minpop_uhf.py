@@ -1253,6 +1253,13 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
         print()
     
+    # Match Gaussian's default linear-dependence handling (IOp(3/59)=6): discard
+    # overlap-matrix eigenvectors whose eigenvalue is below 1e-6. This is already
+    # PySCF's built-in default, but it is pinned here explicitly so the basis
+    # culling matches Gaussian exactly and independently of the PySCF version.
+    scf.hf.remove_overlap_zero_eigenvalue = True
+    scf.hf.overlap_zero_eigenvalue_threshold = 1e-6
+
     # SCF with Gaussian-like defaults
     mf = scf.UHF(mol)
     mf.max_cycle = 128
@@ -1277,9 +1284,15 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     # properties (the spin density = D_alpha - D_beta) under-converged even when
     # the energy looks converged. Newton pushes the gradient down cheaply so the
     # MBS spin densities reproduce Gaussian.
+    mo_coeff, mo_occ = mf.mo_coeff, mf.mo_occ    # converged DIIS/stability orbitals
     mf = mf.newton()
     mf.conv_tol = 1e-11
-    mf.kernel(mf.make_rdm1())
+    mf.kernel(mo_coeff, mo_occ)                   # seed Newton with the MOs, not a
+    # density matrix. Passing make_rdm1() forces Newton to rebuild the orbitals by
+    # diagonalizing F against the near-singular overlap (dm -> MO), which is what
+    # emitted "Newton solver ... treated as density matrix" and the
+    # "Singularity detected in overlap matrix (condition number = ...)" warning.
+    # Seeding with the already-converged MOs skips that redundant step entirely.
     
     if verbose:
         print()
