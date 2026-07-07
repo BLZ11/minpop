@@ -13,6 +13,12 @@ Usage:
     energy = mf.kernel()
 """
 
+# Standard basis-set name. Every *_basis_pyscf.py module should define a
+# module-level BASIS_NAME string; the MinPop tools read it to label output
+# (e.g. the "Basis:" line and the Gaussian-style header) instead of showing a
+# generic "custom dict". Keep it to the name Gaussian prints for this basis.
+BASIS_NAME = "CBSB3"
+
 CBSB3 = {
     'H': [
         # S shell (3 primitives)

@@ -53,6 +53,7 @@ import argparse
 import importlib
 import importlib.util
 import os
+import shlex
 import sys
 import numpy as np
 from pyscf import gto, scf
@@ -114,25 +115,54 @@ def _basis_search_dirs(search_dir=None):
     return unique
 
 
+class _NamedBasis(dict):
+    """
+    A PySCF basis dict that also remembers the basis-set name.
+
+    Behaves exactly like the underlying {element: shells} dict as far as gto.M
+    is concerned, but carries a `.name` attribute so the MinPop tools can label
+    output with the real basis name (from the module's BASIS_NAME) instead of a
+    generic "custom dict".
+    """
+    def __init__(self, mapping, name=None):
+        super().__init__(mapping)
+        self.name = name
+
+
 def _extract_basis_dict(module, dict_name=None, hint=''):
-    """Pull the basis dict out of an imported module."""
+    """
+    Pull the basis dict out of an imported module, tagged with its name.
+
+    The name is taken from the module-level BASIS_NAME - the standard every
+    *_basis_pyscf.py module should follow - falling back to the explicit dict
+    name or the CBSB3-style stem derived from the filename when BASIS_NAME is
+    absent.
+    """
+    stem = (hint or getattr(module, '__name__', '')).upper()
+    stem = stem.replace('_BASIS_PYSCF', '').replace('_BASIS', '')
+
     if dict_name:
-        return getattr(module, dict_name)
-    # derive the conventional name from the module/file stem: cbsb7 -> CBSB7
-    guess = (hint or getattr(module, '__name__', '')).upper()
-    guess = guess.replace('_BASIS_PYSCF', '').replace('_BASIS', '')
-    if guess and hasattr(module, guess):
-        return getattr(module, guess)
-    # fall back to the first module-level dict that looks like a basis table
-    for name, val in vars(module).items():
-        if name.startswith('_') or not isinstance(val, dict) or not val:
-            continue
-        if all(isinstance(k, str) for k in val) and \
-           all(isinstance(v, list) for v in val.values()):
-            return val
-    raise ValueError(
-        f"could not find a basis dict in module {guess or module!r}; "
-        f"specify it explicitly as 'module:DICTNAME'.")
+        basis_dict = getattr(module, dict_name)
+    elif stem and hasattr(module, stem):
+        basis_dict = getattr(module, stem)
+    else:
+        # fall back to the first module-level dict that looks like a basis table
+        basis_dict = None
+        for attr, val in vars(module).items():
+            if attr.startswith('_') or not isinstance(val, dict) or not val:
+                continue
+            if all(isinstance(k, str) for k in val) and \
+               all(isinstance(v, list) for v in val.values()):
+                basis_dict = val
+                break
+        if basis_dict is None:
+            raise ValueError(
+                f"could not find a basis dict in module {stem or module!r}; "
+                f"specify it explicitly as 'module:DICTNAME'.")
+
+    # Standard convention: the module declares its display name in BASIS_NAME.
+    name = getattr(module, 'BASIS_NAME', None) or dict_name or stem or None
+    return _NamedBasis(basis_dict, name=name)
 
 
 def _load_basis_from_pyfile(path, dict_name=None):
@@ -199,6 +229,9 @@ def _basis_label(basis):
     """Human-readable label for a resolved-or-unresolved basis argument."""
     if isinstance(basis, str):
         return basis
+    name = getattr(basis, 'name', None)
+    if name:
+        return name
     if isinstance(basis, dict):
         return f"custom dict ({len(basis)} elements)"
     return repr(basis)
@@ -916,6 +949,123 @@ def _read_xyz(filename):
     return "; ".join(atoms)
 
 
+# Import the standard-orientation module at most once.
+_STD_ORIENT_MOD = None
+
+
+def _load_std_orientation(search_dir=None):
+    """
+    Import gaussian_standard_orientation (Gaussian's 'Standard orientation'
+    frame). A normal import is tried first, then a fallback that loads
+    gaussian_standard_orientation.py from the current directory or next to this
+    script, mirroring how the custom basis modules are located.
+    """
+    global _STD_ORIENT_MOD
+    if _STD_ORIENT_MOD is not None:
+        return _STD_ORIENT_MOD
+    try:
+        import gaussian_standard_orientation as _gso
+        _STD_ORIENT_MOD = _gso
+        return _gso
+    except ImportError:
+        pass
+    for d in _basis_search_dirs(search_dir):
+        path = os.path.join(d, "gaussian_standard_orientation.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location(
+                "gaussian_standard_orientation", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _STD_ORIENT_MOD = module
+            return module
+    raise ImportError(
+        "gaussian_standard_orientation.py not found. Place it next to this "
+        "script or in the current directory, or pass -no-std-orient to skip "
+        "standard reorientation.")
+
+
+def _format_standard_orientation(Z, coords):
+    """
+    Render coordinates as Gaussian 16's "Standard orientation:" table.
+
+    Reproduces Gaussian's fixed layout - center number (I7), atomic number
+    (I11), atomic type (I12, always 0), then 4X and X/Y/Z in Angstroms as F12.6
+    (rounded to 6 decimals) - so the block can be diffed directly against a
+    Gaussian log. Only the printed values are rounded; the coordinates handed to
+    PySCF keep full precision. Components that round to zero are shown unsigned.
+    """
+    sep = " " + "-" * 69
+    lines = [
+        " " * 25 + "Standard orientation:" + " " * 24,
+        sep,
+        " Center     Atomic      Atomic             Coordinates (Angstroms)",
+        " Number     Number       Type             X           Y           Z",
+        sep,
+    ]
+    for center, (z, r) in enumerate(zip(Z, coords), start=1):
+        xyz = [0.0 if abs(float(v)) < 5e-7 else float(v) for v in r]
+        lines.append(f"{center:7d}{int(round(z)):11d}{0:12d}    "
+                     f"{xyz[0]:12.6f}{xyz[1]:12.6f}{xyz[2]:12.6f}")
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def _standardize_atom_str(atom_str, search_dir=None):
+    """
+    Rotate a PySCF atom-spec string into Gaussian's standard orientation.
+
+    The population analysis reproduces Gaussian's minimal-basis density-matrix
+    and per-AO gross-population printouts, which are frame-dependent: p/d axes
+    rotate with the molecule, so the same wavefunction prints different matrix
+    elements in different orientations. Running PySCF in Gaussian's
+    standard-orientation frame - center of nuclear charge, charge-weighted
+    principal axes - makes those printouts line up. Atomic charges and spins are
+    rotationally invariant, so the condensed-to-atoms numbers are unchanged; only
+    the AO-resolved output is affected.
+
+    Parameters
+    ----------
+    atom_str : str
+        PySCF atom spec "El x y z; El x y z; ..." in Angstrom (from _read_xyz).
+    search_dir : str, optional
+        Extra directory to look in for gaussian_standard_orientation.py.
+
+    Returns
+    -------
+    atom_str_std : str
+        The same atoms, order preserved, in Gaussian's standard orientation.
+    orient_table : str
+        The geometry rendered as Gaussian's "Standard orientation:" table
+        (F12.6), ready to print; the caller decides where/whether to show it.
+    """
+    from pyscf.data import elements
+
+    gso = _load_std_orientation(search_dir)
+
+    symbols, Z, coords = [], [], []
+    for entry in atom_str.replace(';', '\n').split('\n'):
+        parts = entry.split()
+        if not parts:
+            continue
+        sym = parts[0]
+        symbols.append(sym)
+        elem = ''.join(c for c in sym if c.isalpha())
+        try:
+            Z.append(elements.charge(elem))
+        except (KeyError, ValueError):
+            Z.append(int(sym))          # numeric atomic number in the xyz
+        coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    coords_std, _used_on_axis = gso.to_standard_orientation(
+        np.asarray(Z, dtype=float), np.asarray(coords, dtype=float),
+        warn=False)
+
+    orient_table = _format_standard_orientation(Z, coords_std)
+    atoms = [f"{sym} {r[0]:.10f} {r[1]:.10f} {r[2]:.10f}"
+             for sym, r in zip(symbols, coords_std)]
+    return "; ".join(atoms), orient_table
+
+
 def _get_ecp_dict(basis, atom_str):
     """Build element-specific ECP dictionary for heavy elements (Z > 36)."""
     from pyscf.data import elements
@@ -1194,6 +1344,7 @@ def _stabilize_uhf(mf, max_cycles=10, verbose=False):
 
 def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      ecp=None, verbose=True, basis_dir=None,
+                     standard_orientation=True,
                      guessmix=False, guessmix_angle=45.0,
                      stable=False, stable_cycles=10):
     """
@@ -1227,6 +1378,16 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     """
     atom_str = _read_xyz(xyz_file)
 
+    # Rotate into Gaussian's standard orientation so the frame-dependent MBS
+    # density-matrix / per-AO population printouts match Gaussian (charges and
+    # spins are rotation-invariant and unaffected). Disable with -no-std-orient
+    # when the input geometry is already in Gaussian's standard orientation. The
+    # "Standard orientation:" table is printed below the molecule summary.
+    orient_table = None
+    if standard_orientation:
+        atom_str, orient_table = _standardize_atom_str(atom_str,
+                                                       search_dir=basis_dir)
+
     # Resolve the computational basis: a standard name is passed through, while
     # 'cbsb3'/'cbsb7' (or a .py path / 'module:DICT') is loaded as a PySCF dict.
     basis_obj = _resolve_basis(basis, search_dir=basis_dir)
@@ -1251,6 +1412,9 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         print(f"Charge: {charge}, Multiplicity: {multiplicity}")
         print(f"Basis: {_basis_label(basis_obj)}")
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
+        if orient_table:
+            print()
+            print(orient_table)
         print()
     
     # Match Gaussian's default linear-dependence handling (IOp(3/59)=6): discard
@@ -1320,6 +1484,10 @@ Examples:
 
 Notes:
   Output matches Gaussian 16's Pop=(Full) IOp(6/27=122,6/12=3) format.
+  Geometries are rotated into Gaussian's standard orientation by default (via
+  gaussian_standard_orientation.py) so the frame-dependent MBS density-matrix /
+  per-AO population output matches Gaussian; pass -no-std-orient to keep the
+  input frame. Atomic charges and spins are rotation-invariant either way.
   ECP auto-detected for def2 basis sets with heavy elements (Z > 36).
   For open-shell-singlet / antiferromagnetic states use -guessmix (Gaussian
   Guess=Mix) together with -stable (Gaussian Stable=Opt): the mix seeds the
@@ -1344,6 +1512,13 @@ Notes:
                              "(cbsb3_basis_pyscf.py / cbsb7_basis_pyscf.py)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
+    parser.add_argument("-no-std-orient", dest="standard_orientation",
+                        action="store_false",
+                        help="Skip Gaussian standard reorientation and use the "
+                             "input geometry as-is (e.g. it is already in "
+                             "Gaussian's standard orientation). By default the "
+                             "geometry is rotated into Gaussian's frame via "
+                             "gaussian_standard_orientation.py")
     parser.add_argument("-guessmix", action="store_true",
                         help="Break spin symmetry via a HOMO-LUMO mixed initial "
                              "guess (Gaussian Guess=Mix) for open-shell singlets / "
@@ -1366,7 +1541,12 @@ Notes:
                         version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
-    
+
+    # Echo the exact command as the very first line so the run is reproducible.
+    if not args.quiet:
+        print("Command line: python "
+              + " ".join(shlex.quote(a) for a in sys.argv))
+
     run_uhf_from_xyz(
         args.xyz_file,
         charge=args.charge,
@@ -1375,6 +1555,7 @@ Notes:
         ecp=args.ecp,
         verbose=not args.quiet,
         basis_dir=args.basis_dir,
+        standard_orientation=args.standard_orientation,
         guessmix=args.guessmix,
         guessmix_angle=args.guessmix_angle,
         stable=args.stable,
