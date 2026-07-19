@@ -44,8 +44,10 @@ Author: Barbaro Zulueta (Pitt Quantum Repository)
 """
 
 import argparse
+import contextlib
 import importlib
 import importlib.util
+import io
 import os
 import shlex
 import sys
@@ -283,8 +285,14 @@ def _build_minimal_basis_mol(mol):
             except (KeyError, ValueError):
                 pass
     
-    # Use Cartesian d-orbitals only for pure second-row systems
-    use_cartesian = has_second_row and not has_transition_metal
+    # Gaussian's MinPop prints the STO-3G* second-row polarization d-shell as
+    # 5 spherical functions (5D: D 0, D+1, D-1, D+2, D-2), NOT 6 Cartesian ones.
+    # Building them Cartesian (cart=True) adds a spurious sixth (xx+yy+zz)
+    # function: one AO too many, and labels/populations that do not line up with
+    # Gaussian (37 vs 36 AOs on chloropropane). Match Gaussian: keep the minimal
+    # basis spherical for every element. (has_second_row / has_transition_metal
+    # are still detected above in case a future caller wants them.)
+    use_cartesian = False
     
     return gto.M(
         atom=mol.atom,
@@ -505,8 +513,14 @@ def _parse_ao_label(orb, cart, is_transition_metal, has_cartesian_d,
     # D orbitals (Spherical)
     if 'd' in orb:
         shell = int(orb[0]) if orb[0].isdigit() else 4
-        
-        if is_transition_metal:
+
+        # STO-3G* polarization on a second-row atom is Gaussian shell 4 (4D),
+        # but PySCF labels the contraction 3d, so force it -- same correction the
+        # Cartesian branch already makes. (Needed now that the second-row minimal
+        # basis is built spherical to match Gaussian's 5D MinPop printout.)
+        if is_second_row:
+            shell = 4
+        elif is_transition_metal:
             if orb == '3d': shell = 4
             elif orb == '4d': shell = 5
         
@@ -1123,6 +1137,91 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 # Command Line Interface
 # =============================================================================
 
+# =============================================================================
+# Optional JSON export (minpop_json.py)
+# =============================================================================
+
+class _Tee:
+    """Write to several streams at once, so the MinPop report can go to the
+    screen and into a capture buffer at the same time."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
+
+    def isatty(self):
+        return False
+
+
+@contextlib.contextmanager
+def _capture_report(sink):
+    """Route everything this run prints into `sink`.
+
+    contextlib.redirect_stdout alone is not enough: PySCF emits its own lines
+    (notably "converged SCF energy = ...", which the JSON's SCF energy is parsed
+    from) through lib.StreamObject.stdout, a CLASS attribute bound to sys.stdout
+    when pyscf is imported, so it never sees the redirect. Point that at the sink
+    too for the duration, then restore it.
+    """
+    from pyscf import lib as _pyscf_lib
+    prev = _pyscf_lib.StreamObject.stdout
+    _pyscf_lib.StreamObject.stdout = sink
+    try:
+        with contextlib.redirect_stdout(sink):
+            yield
+    finally:
+        _pyscf_lib.StreamObject.stdout = prev
+
+
+def _load_minpop_json():
+    """Import minpop_json, looking next to this script if it is not importable."""
+    try:
+        import minpop_json
+        return minpop_json
+    except ImportError:
+        pass
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "minpop_json.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("minpop_json", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _export_json(text, json_path, xyz_dirs=None):
+    """Serialize the MinPop report to JSON. `text` is the report this run just
+    printed, which is exactly what minpop_json.py parses, so the JSON and a saved
+    .out of the same run agree (identical source.sha256).
+
+    Never fatal: a MinPop run that finished should not be lost to an export
+    problem. Notes go to stderr so a redirected stdout (.out) stays parseable.
+    """
+    mj = _load_minpop_json()
+    if mj is None:
+        sys.stderr.write(
+            "[warn] -json: minpop_json.py not found next to "
+            f"{os.path.basename(os.path.abspath(__file__))}; skipping export\n")
+        return None
+    try:
+        out = mj.export_json(text, json_path, xyz_dirs=xyz_dirs)
+    except Exception as exc:                       # noqa: BLE001
+        sys.stderr.write(f"[warn] -json: export failed "
+                         f"({type(exc).__name__}: {exc})\n")
+        return None
+    sys.stderr.write(f"[info] JSON written to {out}\n")
+    return out
+
+
 def main():
     """Command-line entry point."""
     parser = argparse.ArgumentParser(
@@ -1170,6 +1269,14 @@ Notes:
                              "Gaussian's standard orientation). By default the "
                              "geometry is rotated into Gaussian's frame via "
                              "gaussian_standard_orientation.py")
+    parser.add_argument("-json", dest="json_path", metavar="PATH", default=None,
+                        help="Also export the results to PATH as JSON, via "
+                             "minpop_json.py (a .json.gz suffix gzips it). The "
+                             "printed report is unchanged.")
+    parser.add_argument("-json-xyz-dir", dest="json_xyz_dir", metavar="DIR",
+                        action="append", default=None,
+                        help="Extra directory to search for the input-orientation "
+                             ".xyz when exporting JSON (repeatable)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress output")
     parser.add_argument("--version", action="version",
@@ -1178,21 +1285,47 @@ Notes:
     args = parser.parse_args()
 
     # Echo the exact command as the very first line so the run is reproducible.
-    if not args.quiet:
-        print("Command line: python "
-              + " ".join(shlex.quote(a) for a in sys.argv))
+    cmdline = ("Command line: python "
+               + " ".join(shlex.quote(a) for a in sys.argv))
 
-    run_rohf_from_xyz(
-        args.xyz_file,
-        charge=args.charge,
-        multiplicity=args.mult,
-        basis=args.basis,
-        ecp=args.ecp,
-        verbose=not args.quiet,
-        basis_dir=args.basis_dir,
-        standard_orientation=args.standard_orientation
-    )
+    if not args.json_path:
+        if not args.quiet:
+            print(cmdline)
+        run_rohf_from_xyz(
+            args.xyz_file,
+            charge=args.charge,
+            multiplicity=args.mult,
+            basis=args.basis,
+            ecp=args.ecp,
+            verbose=not args.quiet,
+            basis_dir=args.basis_dir,
+            standard_orientation=args.standard_orientation
+        )
+        return
 
+    # -json: minpop_json.py parses the MinPop report, so capture the report while
+    # still letting it through to stdout (unless -q). The full report is always
+    # generated here, even under -q, because it is the JSON's source.
+    _buf = io.StringIO()
+    _sink = _buf if args.quiet else _Tee(sys.stdout, _buf)
+    with _capture_report(_sink):
+        print(cmdline)
+        run_rohf_from_xyz(
+            args.xyz_file,
+            charge=args.charge,
+            multiplicity=args.mult,
+            basis=args.basis,
+            ecp=args.ecp,
+            verbose=True,
+            basis_dir=args.basis_dir,
+            standard_orientation=args.standard_orientation
+        )
+
+    # the input .xyz exists during a live run, so both the input and standard
+    # orientations land in the record
+    _xyz_dirs = list(args.json_xyz_dir or [])
+    _xyz_dirs.append(os.path.dirname(os.path.abspath(args.xyz_file)))
+    _export_json(_buf.getvalue(), args.json_path, xyz_dirs=_xyz_dirs)
 
 if __name__ == "__main__":
     main()
