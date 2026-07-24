@@ -44,11 +44,10 @@ Author: Barbaro Zulueta (Pitt Quantum Repository)
 """
 
 import argparse
-import contextlib
 import importlib
 import importlib.util
-import io
 import os
+import re
 import shlex
 import sys
 import numpy as np
@@ -285,13 +284,9 @@ def _build_minimal_basis_mol(mol):
             except (KeyError, ValueError):
                 pass
     
-    # Gaussian's MinPop prints the STO-3G* second-row polarization d-shell as
-    # 5 spherical functions (5D: D 0, D+1, D-1, D+2, D-2), NOT 6 Cartesian ones.
-    # Building them Cartesian (cart=True) adds a spurious sixth (xx+yy+zz)
-    # function: one AO too many, and labels/populations that do not line up with
-    # Gaussian (37 vs 36 AOs on chloropropane). Match Gaussian: keep the minimal
-    # basis spherical for every element. (has_second_row / has_transition_metal
-    # are still detected above in case a future caller wants them.)
+    # Gaussian's MinPop uses a spherical (5D) minimal basis throughout,
+    # including STO-3G* d-polarization on second-row atoms (verified vs
+    # Gaussian: Si2 -> 28 AOs; Cl d-shell labeled 4D 0/4D+-1/4D+-2, not 6D).
     use_cartesian = False
     
     return gto.M(
@@ -513,18 +508,15 @@ def _parse_ao_label(orb, cart, is_transition_metal, has_cartesian_d,
     # D orbitals (Spherical)
     if 'd' in orb:
         shell = int(orb[0]) if orb[0].isdigit() else 4
-
-        # STO-3G* polarization on a second-row atom is Gaussian shell 4 (4D),
-        # but PySCF labels the contraction 3d, so force it -- same correction the
-        # Cartesian branch already makes. (Needed now that the second-row minimal
-        # basis is built spherical to match Gaussian's 5D MinPop printout.)
+        
+        # STO-3G* d-polarization on second-row atoms is shell 4 in Gaussian
+        # (PySCF labels it '3d'); mirror the Cartesian branch above.
         if is_second_row:
             shell = 4
         elif is_transition_metal:
             if orb == '3d': shell = 4
             elif orb == '4d': shell = 5
-        
-        if is_5th_period:
+        elif is_5th_period:
             shell = 4 if d_block_idx == 0 else 6
         
         m_val, subtype = _parse_spherical_d(cart)
@@ -931,6 +923,137 @@ def _get_ecp_dict(basis, atom_str):
 # Main Analysis Functions
 # =============================================================================
 
+_AZ_P_RE = re.compile(r'^(\d+)P([XYZ])$')
+_AZ_D_RE = re.compile(r'^(\d+)D([ +\-]\d)$')
+
+
+def _az_build_z_rotation(ao_labels, theta):
+    """AO-basis operator for a rotation of the molecule by ``theta`` about Z.
+
+    Pairs (nPX,nPY) and (nD+m,nD-m) rotate by m*theta; S, PZ and D 0 are
+    invariant. Validated against Gaussian for Si2 (full-matrix residual ~5e-5).
+    """
+    n = len(ao_labels)
+    U = np.eye(n)
+    plus, minus = {}, {}
+    for i, lab in enumerate(ao_labels):
+        atom, _elem, ao, _ = lab
+        mP = _AZ_P_RE.match(ao)
+        if mP:
+            shell, axis = int(mP.group(1)), mP.group(2)
+            if axis == 'X':
+                plus[(atom, shell, 1)] = i
+            elif axis == 'Y':
+                minus[(atom, shell, 1)] = i
+            continue
+        mD = _AZ_D_RE.match(ao)
+        if mD:
+            shell = int(mD.group(1))
+            mv = int(mD.group(2).replace(' ', ''))
+            if mv > 0:
+                plus[(atom, shell, mv)] = i
+            elif mv < 0:
+                minus[(atom, shell, -mv)] = i
+    for key, a in plus.items():
+        b = minus.get(key)
+        if b is None:
+            continue
+        m = key[2]
+        c, s = np.cos(m * theta), np.sin(m * theta)
+        U[a, a] = c
+        U[a, b] = -s
+        U[b, a] = s
+        U[b, b] = c
+    return U
+
+
+def _az_px_indices(ao_labels):
+    return [i for i, lab in enumerate(ao_labels)
+            if _AZ_P_RE.match(lab[2]) and lab[2].endswith('X')]
+
+
+def _az_golden_max(dm, ao_labels, pxi, a, b, tol=1e-13, maxiter=200):
+    """Golden-section search for the theta that maximizes total PX pi content.
+
+    The coarse grid argmax is quantized to the scan spacing, which leaves up to
+    half a step of misalignment. That is small in angle but puts ~1e-3 into
+    individual density-matrix elements and breaks idempotency of the gauge. This
+    refines the bracketing interval to machine precision.
+    """
+    def f(t):
+        U = _az_build_z_rotation(ao_labels, t)
+        M = U @ dm @ U.T
+        return M[np.ix_(pxi, pxi)].sum()
+    invphi = (np.sqrt(5.0) - 1.0) / 2.0
+    c = b - invphi * (b - a)
+    d = a + invphi * (b - a)
+    fc, fd = f(c), f(d)
+    for _ in range(maxiter):
+        if (b - a) < tol:
+            break
+        if fc > fd:
+            b, d, fd = d, c, fc
+            c = b - invphi * (b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + invphi * (b - a)
+            fd = f(d)
+    return 0.5 * (a + b)
+
+
+def _apply_azimuthal_gauge(dm_list, ao_labels, coords_bohr,
+                           tol_linear=1e-3, tol_aniso=1e-2, verbose=False):
+    """Canonicalize the azimuth about the molecular axis, LINEAR molecules only.
+
+    A linear molecule has every atom on the symmetry axis, so Gaussian's
+    standard-orientation rules (which fix x/y from an off-axis "key atom") leave
+    the azimuth undetermined. The frame-dependent MBS density/population printouts
+    then differ from Gaussian by a rotation about the molecular axis. This rotates
+    to a deterministic frame (maximum PX pi content).
+
+    STRICT NO-OP for non-linear molecules (their standard orientation is fully
+    fixed) and for cylindrically symmetric linear molecules (no pi anisotropy to
+    canonicalize). Returns (dm_list_out, theta); theta is None when no gauge was
+    applied.
+    """
+    dm_total = dm_list[2] if len(dm_list) >= 3 else dm_list[0]
+    coords = np.asarray(coords_bohr)
+    # (1) linear? In standard orientation the axis is Z: x,y ~ 0 for every atom.
+    if coords.shape[0] < 2 or np.abs(coords[:, :2]).max() > tol_linear:
+        return dm_list, None
+    pxi = _az_px_indices(ao_labels)
+    if not pxi:
+        return dm_list, None
+    # (2) scan g(theta) = total PX content; require genuine pi anisotropy.
+    ths = np.linspace(0.0, np.pi, 1441, endpoint=False)
+    g = np.empty_like(ths)
+    for k, t in enumerate(ths):
+        U = _az_build_z_rotation(ao_labels, t)
+        M = U @ dm_total @ U.T
+        g[k] = M[np.ix_(pxi, pxi)].sum()
+    if (g.max() - g.min()) < tol_aniso:
+        return dm_list, None
+    k = int(np.argmax(g))
+    step = ths[1] - ths[0]
+    theta = _az_golden_max(dm_total, ao_labels, pxi,
+                           ths[k] - step, ths[k] + step)
+    # (3) sign convention: largest inter-center PX-PX coupling >= 0 (fixes 180deg).
+    U = _az_build_z_rotation(ao_labels, theta)
+    Mt = U @ dm_total @ U.T
+    off = Mt[np.ix_(pxi, pxi)].copy()
+    np.fill_diagonal(off, 0.0)
+    if off.size and off.flat[np.argmax(np.abs(off))] < 0:
+        theta = (theta + np.pi) % (2 * np.pi)
+        U = _az_build_z_rotation(ao_labels, theta)
+    out = [U @ D @ U.T for D in dm_list]
+    if verbose:
+        print("Azimuthal gauge (linear molecule): rotated "
+              f"{np.degrees(theta):.2f} deg about the molecular axis to the "
+              "canonical PX-max frame.")
+    return out, theta
+
+
 def minpop_rohf(mf, verbose=True):
     """
     Perform MinPop population analysis on a converged ROHF calculation.
@@ -1008,7 +1131,25 @@ def minpop_rohf(mf, verbose=True):
     pop_spin = _reorder_matrix(pop_spin, reorder)
     
     ao_labels = [_convert_label_to_gaussian(lbl) for lbl in ao_labels_raw]
-    
+
+    # Canonical azimuthal gauge for LINEAR molecules. Their standard orientation
+    # leaves the azimuth about the molecular axis undetermined (no off-axis key
+    # atom), so the frame-dependent MBS density/population printouts otherwise
+    # differ from Gaussian by an arbitrary rotation about that axis. Rotate to a
+    # deterministic frame; strict no-op for non-linear or cylindrically symmetric
+    # systems. When applied, populations are rebuilt from the rotated density
+    # (Mulliken is D (x) S with the fixed lab-frame S, so this is exact).
+    dm_list, _gauge_theta = _apply_azimuthal_gauge(
+        [dm_alpha, dm_beta, dm_total, dm_spin], ao_labels,
+        mol.atom_coords(), verbose=verbose)
+    if _gauge_theta is not None:
+        dm_alpha, dm_beta, dm_total, dm_spin = dm_list
+        S_min_g = _reorder_matrix(S_min, reorder)
+        pop_alpha = _mulliken_pop_matrix(dm_alpha, S_min_g)
+        pop_beta = _mulliken_pop_matrix(dm_beta, S_min_g)
+        pop_total = _mulliken_pop_matrix(dm_total, S_min_g)
+        pop_spin = _mulliken_pop_matrix(dm_spin, S_min_g)
+
     # Gross orbital populations
     gross = np.column_stack([
         np.sum(pop_total, axis=0),
@@ -1137,91 +1278,6 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 # Command Line Interface
 # =============================================================================
 
-# =============================================================================
-# Optional JSON export (minpop_json.py)
-# =============================================================================
-
-class _Tee:
-    """Write to several streams at once, so the MinPop report can go to the
-    screen and into a capture buffer at the same time."""
-
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, s):
-        for st in self._streams:
-            st.write(s)
-        return len(s)
-
-    def flush(self):
-        for st in self._streams:
-            st.flush()
-
-    def isatty(self):
-        return False
-
-
-@contextlib.contextmanager
-def _capture_report(sink):
-    """Route everything this run prints into `sink`.
-
-    contextlib.redirect_stdout alone is not enough: PySCF emits its own lines
-    (notably "converged SCF energy = ...", which the JSON's SCF energy is parsed
-    from) through lib.StreamObject.stdout, a CLASS attribute bound to sys.stdout
-    when pyscf is imported, so it never sees the redirect. Point that at the sink
-    too for the duration, then restore it.
-    """
-    from pyscf import lib as _pyscf_lib
-    prev = _pyscf_lib.StreamObject.stdout
-    _pyscf_lib.StreamObject.stdout = sink
-    try:
-        with contextlib.redirect_stdout(sink):
-            yield
-    finally:
-        _pyscf_lib.StreamObject.stdout = prev
-
-
-def _load_minpop_json():
-    """Import minpop_json, looking next to this script if it is not importable."""
-    try:
-        import minpop_json
-        return minpop_json
-    except ImportError:
-        pass
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "minpop_json.py")
-    if not os.path.exists(path):
-        return None
-    spec = importlib.util.spec_from_file_location("minpop_json", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _export_json(text, json_path, xyz_dirs=None):
-    """Serialize the MinPop report to JSON. `text` is the report this run just
-    printed, which is exactly what minpop_json.py parses, so the JSON and a saved
-    .out of the same run agree (identical source.sha256).
-
-    Never fatal: a MinPop run that finished should not be lost to an export
-    problem. Notes go to stderr so a redirected stdout (.out) stays parseable.
-    """
-    mj = _load_minpop_json()
-    if mj is None:
-        sys.stderr.write(
-            "[warn] -json: minpop_json.py not found next to "
-            f"{os.path.basename(os.path.abspath(__file__))}; skipping export\n")
-        return None
-    try:
-        out = mj.export_json(text, json_path, xyz_dirs=xyz_dirs)
-    except Exception as exc:                       # noqa: BLE001
-        sys.stderr.write(f"[warn] -json: export failed "
-                         f"({type(exc).__name__}: {exc})\n")
-        return None
-    sys.stderr.write(f"[info] JSON written to {out}\n")
-    return out
-
-
 def main():
     """Command-line entry point."""
     parser = argparse.ArgumentParser(
@@ -1269,14 +1325,6 @@ Notes:
                              "Gaussian's standard orientation). By default the "
                              "geometry is rotated into Gaussian's frame via "
                              "gaussian_standard_orientation.py")
-    parser.add_argument("-json", dest="json_path", metavar="PATH", default=None,
-                        help="Also export the results to PATH as JSON, via "
-                             "minpop_json.py (a .json.gz suffix gzips it). The "
-                             "printed report is unchanged.")
-    parser.add_argument("-json-xyz-dir", dest="json_xyz_dir", metavar="DIR",
-                        action="append", default=None,
-                        help="Extra directory to search for the input-orientation "
-                             ".xyz when exporting JSON (repeatable)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress output")
     parser.add_argument("--version", action="version",
@@ -1285,47 +1333,21 @@ Notes:
     args = parser.parse_args()
 
     # Echo the exact command as the very first line so the run is reproducible.
-    cmdline = ("Command line: python "
-               + " ".join(shlex.quote(a) for a in sys.argv))
+    if not args.quiet:
+        print("Command line: python "
+              + " ".join(shlex.quote(a) for a in sys.argv))
 
-    if not args.json_path:
-        if not args.quiet:
-            print(cmdline)
-        run_rohf_from_xyz(
-            args.xyz_file,
-            charge=args.charge,
-            multiplicity=args.mult,
-            basis=args.basis,
-            ecp=args.ecp,
-            verbose=not args.quiet,
-            basis_dir=args.basis_dir,
-            standard_orientation=args.standard_orientation
-        )
-        return
+    run_rohf_from_xyz(
+        args.xyz_file,
+        charge=args.charge,
+        multiplicity=args.mult,
+        basis=args.basis,
+        ecp=args.ecp,
+        verbose=not args.quiet,
+        basis_dir=args.basis_dir,
+        standard_orientation=args.standard_orientation
+    )
 
-    # -json: minpop_json.py parses the MinPop report, so capture the report while
-    # still letting it through to stdout (unless -q). The full report is always
-    # generated here, even under -q, because it is the JSON's source.
-    _buf = io.StringIO()
-    _sink = _buf if args.quiet else _Tee(sys.stdout, _buf)
-    with _capture_report(_sink):
-        print(cmdline)
-        run_rohf_from_xyz(
-            args.xyz_file,
-            charge=args.charge,
-            multiplicity=args.mult,
-            basis=args.basis,
-            ecp=args.ecp,
-            verbose=True,
-            basis_dir=args.basis_dir,
-            standard_orientation=args.standard_orientation
-        )
-
-    # the input .xyz exists during a live run, so both the input and standard
-    # orientations land in the record
-    _xyz_dirs = list(args.json_xyz_dir or [])
-    _xyz_dirs.append(os.path.dirname(os.path.abspath(args.xyz_file)))
-    _export_json(_buf.getvalue(), args.json_path, xyz_dirs=_xyz_dirs)
 
 if __name__ == "__main__":
     main()
