@@ -1596,6 +1596,19 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if guessmix:
         dm0 = _init_guess_mixed(mol, mixing_angle_deg=guessmix_angle,
                                 verbose=verbose)
+    elif mol.spin == 0:
+        # Plain UHF on a closed-shell singlet has to collapse onto the
+        # restricted solution, and Gaussian duly prints spin densities of
+        # exactly zero. PySCF's stock UHF guess is not exactly spin symmetric,
+        # and the residual survives the SCF: about 1e-6 in the AO density,
+        # which amplifies to ~1e-4 in the MBS spin densities and fails a 1e-4
+        # comparison. Newton tightening barely touches it, because the
+        # asymmetry costs no energy. Seeding alpha and beta with the identical
+        # density keeps them identical through every iteration, so the spin
+        # density comes out identically zero. -guessmix takes precedence, since
+        # breaking that symmetry on purpose is the whole point of Guess=Mix.
+        _dm_restricted = scf.hf.get_init_guess(mol, 'minao')
+        dm0 = np.array([_dm_restricted * 0.5, _dm_restricted * 0.5])
     mf.kernel(dm0=dm0)
 
     # Follow internal instabilities to the lower (broken-symmetry) solution
