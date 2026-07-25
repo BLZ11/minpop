@@ -1236,7 +1236,7 @@ def _apply_azimuthal_gauge(dm_list, ao_labels, coords_bohr,
     return out, theta
 
 
-def minpop_uhf(mf, verbose=True):
+def minpop_uhf(mf, verbose=True, azimuthal_gauge=True):
     """
     Perform MinPop population analysis on a converged UHF calculation.
     
@@ -1334,9 +1334,12 @@ def minpop_uhf(mf, verbose=True):
     # deterministic frame; strict no-op for non-linear or cylindrically symmetric
     # systems. When applied, populations are rebuilt from the rotated density
     # (Mulliken is D (x) S with the fixed lab-frame S, so this is exact).
-    dm_list, _gauge_theta = _apply_azimuthal_gauge(
-        [dm_alpha, dm_beta, dm_total, dm_spin], ao_labels,
-        mol.atom_coords(), verbose=verbose)
+    if azimuthal_gauge:
+        dm_list, _gauge_theta = _apply_azimuthal_gauge(
+            [dm_alpha, dm_beta, dm_total, dm_spin], ao_labels,
+            mol.atom_coords(), verbose=verbose)
+    else:
+        dm_list, _gauge_theta = [dm_alpha, dm_beta, dm_total, dm_spin], None
     if _gauge_theta is not None:
         dm_alpha, dm_beta, dm_total, dm_spin = dm_list
         S_min_g = _reorder_matrix(S_min, reorder)
@@ -1500,6 +1503,7 @@ def _stabilize_uhf(mf, max_cycles=10, verbose=False):
 def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      ecp=None, verbose=True, basis_dir=None,
                      standard_orientation=True,
+                     azimuthal_gauge=True,
                      guessmix=False, guessmix_angle=45.0,
                      stable=False, stable_cycles=10):
     """
@@ -1616,7 +1620,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose:
         print()
     
-    return minpop_uhf(mf, verbose=verbose)
+    return minpop_uhf(mf, verbose=verbose, azimuthal_gauge=azimuthal_gauge)
 
 
 # =============================================================================
@@ -1667,6 +1671,13 @@ Notes:
                              "(cbsb3_basis_pyscf.py / cbsb7_basis_pyscf.py)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
+    parser.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge",
+                        action="store_false", default=True,
+                        help="Do not canonicalize the azimuth of linear "
+                             "molecules. Use together with -no-std-orient "
+                             "when the input geometry is already Gaussian's "
+                             "standard orientation, so the frame is adopted "
+                             "verbatim and nothing rotates it afterwards.")
     parser.add_argument("-no-std-orient", dest="standard_orientation",
                         action="store_false",
                         help="Skip Gaussian standard reorientation and use the "
@@ -1711,6 +1722,7 @@ Notes:
         verbose=not args.quiet,
         basis_dir=args.basis_dir,
         standard_orientation=args.standard_orientation,
+        azimuthal_gauge=args.azimuthal_gauge,
         guessmix=args.guessmix,
         guessmix_angle=args.guessmix_angle,
         stable=args.stable,
