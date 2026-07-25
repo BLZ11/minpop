@@ -1207,22 +1207,36 @@ def _apply_azimuthal_gauge(dm_list, ao_labels, coords_bohr,
     pxi = _az_px_indices(ao_labels)
     if not pxi:
         return dm_list, None
-    # (2) scan g(theta) = total PX content; require genuine pi anisotropy.
+    # (2) scan the PX content and require genuine pi anisotropy. A rigid rotation
+    # turns every spin channel alike, so any channel pins the same angle, but a
+    # nearly cylindrical one pins it badly. Weigh the total density against the
+    # spin density and canonicalize on whichever is more anisotropic: in a 2-Pi
+    # radical such as NO the unpaired electron sits in the spin density, leaving
+    # the total density almost isotropic (PX variation ~5e-3, under the gate)
+    # while the spin density varies strongly.
+    candidates = [dm_total]
+    if len(dm_list) >= 4 and dm_list[3] is not None:
+        candidates.append(dm_list[3])
     ths = np.linspace(0.0, np.pi, 1441, endpoint=False)
-    g = np.empty_like(ths)
+    curves = np.empty((len(ths), len(candidates)))
     for k, t in enumerate(ths):
         U = _az_build_z_rotation(ao_labels, t)
-        M = U @ dm_total @ U.T
-        g[k] = M[np.ix_(pxi, pxi)].sum()
-    if (g.max() - g.min()) < tol_aniso:
+        for c, D in enumerate(candidates):
+            M = U @ D @ U.T
+            curves[k, c] = M[np.ix_(pxi, pxi)].sum()
+    spans = curves.max(axis=0) - curves.min(axis=0)
+    best = int(np.argmax(spans))
+    if spans[best] < tol_aniso:
         return dm_list, None
+    dm_obj = candidates[best]
+    g = curves[:, best]
     k = int(np.argmax(g))
     step = ths[1] - ths[0]
-    theta = _az_golden_max(dm_total, ao_labels, pxi,
+    theta = _az_golden_max(dm_obj, ao_labels, pxi,
                            ths[k] - step, ths[k] + step)
     # (3) sign convention: largest inter-center PX-PX coupling >= 0 (fixes 180deg).
     U = _az_build_z_rotation(ao_labels, theta)
-    Mt = U @ dm_total @ U.T
+    Mt = U @ dm_obj @ U.T
     off = Mt[np.ix_(pxi, pxi)].copy()
     np.fill_diagonal(off, 0.0)
     if off.size and off.flat[np.argmax(np.abs(off))] < 0:
