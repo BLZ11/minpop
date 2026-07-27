@@ -46,6 +46,8 @@ Author: Barbaro Zulueta (Pitt Quantum Repository)
 import argparse
 import importlib
 import importlib.util
+import contextlib
+import io
 import os
 import re
 import shlex
@@ -1295,6 +1297,116 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 # Command Line Interface
 # =============================================================================
 
+
+# --------------------------------------------------------------------------- #
+# Live export (-json / -csv-long / -csv-features)
+# --------------------------------------------------------------------------- #
+class _TeeStream:
+    """Write-through to several streams: the MinPop report reaches stdout
+    unchanged while a copy accumulates for export."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._streams[0], name)
+
+
+@contextlib.contextmanager
+def _capture_report():
+    """Tee stdout into a buffer while the analysis runs.
+
+    PySCF binds lib.StreamObject.stdout to sys.stdout at import time, so BOTH
+    must be redirected; with sys.stdout alone the 'converged SCF energy' line
+    never reaches the buffer and every exported record loses its energy.
+    """
+    buf = io.StringIO()
+    tee = _TeeStream(sys.stdout, buf)
+    old_sys = sys.stdout
+    from pyscf import lib
+    old_lib = lib.StreamObject.stdout
+    sys.stdout = tee
+    lib.StreamObject.stdout = tee
+    try:
+        yield buf
+    finally:
+        sys.stdout = old_sys
+        lib.StreamObject.stdout = old_lib
+
+
+def _load_export_module():
+    """Find minpop_json_csv: import path, next to this script, then the cwd.
+    Returns None with a stderr note when unavailable; export is optional and
+    must never fail a run whose analysis already succeeded."""
+    try:
+        import minpop_json_csv as mod
+        return mod
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.getcwd()):
+        path = os.path.join(d, "minpop_json_csv.py")
+        if os.path.isfile(path):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "minpop_json_csv", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception as exc:
+                print(f"[export] failed to load {path}: {exc}",
+                      file=sys.stderr)
+                return None
+    print("[export] minpop_json_csv.py not found (import path, next to this "
+          "script, current directory); skipping export", file=sys.stderr)
+    return None
+
+
+def _export_outputs(text, args):
+    """Write the requested JSON/CSV products from the captured report.
+
+    All notes go to stderr so a redirected .out stays parseable, and every
+    failure is reported and swallowed: the export is a convenience layered on
+    an analysis that already succeeded."""
+    mod = _load_export_module()
+    if mod is None:
+        return
+    src = args.xyz_file
+    if args.json_path:
+        try:
+            mod.export_json(text, args.json_path, source=src,
+                            xyz_dirs=args.json_xyz_dir)
+            print(f"[export] json -> {args.json_path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[export] json failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+    if args.csv_long:
+        try:
+            parsed = mod._parse_for_csv(text, source=src)
+        except Exception as exc:
+            print(f"[export] csv parse failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return
+        if args.csv_long:
+            try:
+                n = mod.write_long_csv([parsed], args.csv_long,
+                                       sparse_tol=args.csv_sparse_tol)
+                print(f"[export] csv-long ({n} rows) -> {args.csv_long}",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"[export] csv-long failed: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def main():
     """Command-line entry point."""
     parser = argparse.ArgumentParser(
@@ -1349,6 +1461,25 @@ Notes:
                              "Gaussian's standard orientation). By default the "
                              "geometry is rotated into Gaussian's frame via "
                              "gaussian_standard_orientation.py")
+    parser.add_argument("-json", dest="json_path", metavar="PATH",
+                        default=None,
+                        help="Also serialize this run to a JSON record via "
+                             "minpop_json_csv.py (never fatal: a failed export "
+                             "warns on stderr and leaves the analysis intact)")
+    parser.add_argument("-json-xyz-dir", dest="json_xyz_dir", action="append",
+                        metavar="DIR",
+                        help="Directory with the input-orientation .xyz for "
+                             "the JSON record (repeatable)")
+    parser.add_argument("-csv-long", dest="csv_long", metavar="PATH",
+                        default=None,
+                        help="Also write this run's nonzero MBS elements as a "
+                             "tidy sparse CSV (one file per run; aggregate a "
+                             "dataset afterwards with minpop_json_csv.py "
+                             "--runs)")
+    parser.add_argument("-csv-sparse-tol", dest="csv_sparse_tol", type=float,
+                        default=0.0,
+                        help="Drop |value| <= this from -csv-long "
+                             "(default 0: exact zeros only)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress output")
     parser.add_argument("--version", action="version",
@@ -1356,22 +1487,35 @@ Notes:
     
     args = parser.parse_args()
 
-    # Echo the exact command as the very first line so the run is reproducible.
-    if not args.quiet:
-        print("Command line: python "
-              + " ".join(shlex.quote(a) for a in sys.argv))
+    exporting = bool(args.json_path or args.csv_long)
+    if exporting and args.quiet:
+        print("[export] note: -q suppresses the report the exports are parsed "
+              "from; exported records will be mostly empty", file=sys.stderr)
 
-    run_rohf_from_xyz(
-        args.xyz_file,
-        charge=args.charge,
-        multiplicity=args.mult,
-        basis=args.basis,
-        ecp=args.ecp,
-        verbose=not args.quiet,
-        basis_dir=args.basis_dir,
-        standard_orientation=args.standard_orientation,
-        azimuthal_gauge=args.azimuthal_gauge
-    )
+    # The capture starts before the command echo so the exported record hashes
+    # the same bytes a redirected .out receives (source.sha256 == sha of .out).
+    ctx = _capture_report() if exporting else contextlib.nullcontext()
+    with ctx as buf:
+        # Echo the exact command as the very first line so the run is
+        # reproducible.
+        if not args.quiet:
+            print("Command line: python "
+                  + " ".join(shlex.quote(a) for a in sys.argv))
+
+        run_rohf_from_xyz(
+            args.xyz_file,
+            charge=args.charge,
+            multiplicity=args.mult,
+            basis=args.basis,
+            ecp=args.ecp,
+            verbose=not args.quiet,
+            basis_dir=args.basis_dir,
+            standard_orientation=args.standard_orientation,
+            azimuthal_gauge=args.azimuthal_gauge
+        )
+
+    if exporting:
+        _export_outputs(buf.getvalue(), args)
 
 
 if __name__ == "__main__":
