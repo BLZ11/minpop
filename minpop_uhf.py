@@ -1458,7 +1458,18 @@ def _init_guess_triplet(mol, mode="density", conv_tol=1e-9, max_cycle=128,
     mf_t.max_cycle = max_cycle
     mf_t.conv_tol = conv_tol
     mf_t.kernel()
-    state = "converged" if mf_t.converged else "NOT CONVERGED"
+    if not mf_t.converged:
+        # Stop here rather than downstream. An unconverged triplet gives
+        # meaningless orbitals and a meaningless density, so whatever the
+        # singlet UHF then does with them is not a controlled starting point,
+        # and a failure several steps later reads as a singlet problem when the
+        # guess was the problem.
+        raise MinPopSCFError(
+            f"triplet ROHF guess did not converge in {max_cycle} cycles "
+            f"(E = {mf_t.e_tot:.9f}). Its orbitals and density are "
+            f"meaningless, so the singlet UHF is not attempted. Use "
+            f"-guessmix instead, or raise the triplet cycle limit.")
+    state = "converged"
 
     if mode == "density":
         dm0 = np.asarray(mf_t.make_rdm1())
