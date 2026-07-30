@@ -1477,8 +1477,10 @@ def _init_guess_triplet(mol, mode="density", conv_tol=1e-9, max_cycle=128,
             raise RuntimeError("triplet ROHF did not return an (alpha, beta) "
                                f"density (got shape {dm0.shape})")
         if verbose:
-            print(f"Triplet ROHF guess [density]: E(triplet) = "
-                  f"{mf_t.e_tot:.9f} ({state}); handing its spin-polarized "
+            print(f"Triplet ROHF guess [density]: triplet ROHF in the same "
+                  f"basis ({mol_t.nao} AOs, charge {mol_t.charge}); "
+                  f"E(triplet) = {mf_t.e_tot:.9f} ({state})")
+            print(f"Triplet ROHF guess [density]: handing its spin-polarized "
                   f"density to the singlet UHF")
         return dm0
 
@@ -1503,8 +1505,9 @@ def _init_guess_triplet(mol, mode="density", conv_tol=1e-9, max_cycle=128,
     occ_b[somos[1]] = 1.0               # the other to beta
     dm0 = scf.uhf.make_rdm1((mo, mo), (occ_a, occ_b))
     if verbose:
-        print(f"Triplet ROHF guess [orbitals]: E(triplet) = {mf_t.e_tot:.9f} "
-              f"({state})")
+        print(f"Triplet ROHF guess [orbitals]: triplet ROHF in the same "
+              f"basis ({mol_t.nao} AOs, charge {mol_t.charge}); "
+              f"E(triplet) = {mf_t.e_tot:.9f} ({state})")
         print(f"Triplet ROHF guess [orbitals]: {len(doubly)} doubly occupied "
               f"plus MO {somos[0] + 1} to alpha and MO {somos[1] + 1} to beta "
               f"({nocc} electrons per spin)")
