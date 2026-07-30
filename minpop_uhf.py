@@ -1402,7 +1402,8 @@ def minpop_uhf(mf, verbose=True, azimuthal_gauge=True):
     return results
 
 
-def _init_guess_triplet(mol, conv_tol=1e-9, max_cycle=128, verbose=False):
+def _init_guess_triplet(mol, mode="density", conv_tol=1e-9, max_cycle=128,
+                        verbose=False):
     """Broken-symmetry singlet guess from a converged triplet ROHF.
 
     For an open-shell singlet (a diradical, or a stretched bond near a
@@ -1410,34 +1411,39 @@ def _init_guess_triplet(mol, conv_tol=1e-9, max_cycle=128, verbose=False):
     and LUMO are nearly degenerate, so a mixed guess can relax straight back to
     the symmetric stationary point and the SCF settles on an answer that is not
     the UHF minimum. A triplet ROHF in the SAME basis converges readily and
-    puts the two unpaired electrons in different spatial orbitals, so its alpha
-    and beta densities genuinely differ. Handing that pair to the singlet UHF
-    starts the SCF inside the broken-symmetry basin from the first iteration,
-    with no orbital rotation involved, which is why it needs no -guessmix.
+    puts the two unpaired electrons in two distinct spatial orbitals, so alpha
+    and beta differ from the first iteration and the SCF starts inside the
+    broken-symmetry basin without any orbital rotation. That is why this needs
+    no -guessmix.
 
-    The triplet only supplies a density. It carries the triplet's alpha and
-    beta electron counts (N/2+1 and N/2-1); the singlet UHF reoccupies to equal
-    counts on its first diagonalization and keeps the spin polarization built
-    into the orbitals.
+    Both modes hand scf.UHF a density, as every other initial guess does.
 
-    Parameters
-    ----------
-    mol : pyscf.gto.Mole
-        The SINGLET target (charge and spin already set, spin must be 0).
-    conv_tol, max_cycle : optional
-        Convergence controls for the triplet ROHF.
-    verbose : bool, optional
-        Print the triplet energy for provenance.
+    mode='density' (default)
+        Use the triplet's own alpha and beta density matrices. Simple and
+        consistent with the -guess family, but the density carries the
+        triplet's spin populations, N/2+1 alpha against N/2-1 beta, so the
+        opening Fock describes a configuration with the wrong number of
+        electrons in each channel. The singlet UHF reoccupies to N/2 each on
+        its first diagonalization.
+
+    mode='orbitals'
+        Reoccupy the triplet's spatial orbitals for the singlet: both spins
+        take the doubly occupied core, then alpha takes the first singly
+        occupied orbital and beta the second. This starts from the correct
+        N/2 electrons per spin while still placing the two unpaired electrons
+        in different spatial orbitals. It searches a different part of the
+        surface and can find broken-symmetry minima the density mode misses.
 
     Returns
     -------
     dm0 : ndarray, shape (2, nao, nao)
-        Spin-polarized initial density for the singlet scf.UHF.
     """
     if mol.spin != 0:
         raise ValueError("triplet guess applies to singlets only "
                          f"(got spin={mol.spin}, i.e. multiplicity "
                          f"{mol.spin + 1})")
+    if mode not in ("density", "orbitals"):
+        raise ValueError(f"unknown triplet guess mode {mode!r}")
     mol_t = mol.copy()
     mol_t.spin = 2                      # 2S, i.e. a triplet
     mol_t.build(False, False)           # same basis, charge and ECP
@@ -1452,16 +1458,46 @@ def _init_guess_triplet(mol, conv_tol=1e-9, max_cycle=128, verbose=False):
     mf_t.max_cycle = max_cycle
     mf_t.conv_tol = conv_tol
     mf_t.kernel()
-    dm = np.asarray(mf_t.make_rdm1())
+    state = "converged" if mf_t.converged else "NOT CONVERGED"
+
+    if mode == "density":
+        dm0 = np.asarray(mf_t.make_rdm1())
+        if dm0.ndim != 3 or dm0.shape[0] != 2:
+            raise RuntimeError("triplet ROHF did not return an (alpha, beta) "
+                               f"density (got shape {dm0.shape})")
+        if verbose:
+            print(f"Triplet ROHF guess [density]: E(triplet) = "
+                  f"{mf_t.e_tot:.9f} ({state}); handing its spin-polarized "
+                  f"density to the singlet UHF")
+        return dm0
+
+    mo = np.asarray(mf_t.mo_coeff)      # one spatial set: (nao, nmo)
+    occ_t = np.asarray(mf_t.mo_occ)
+    doubly = np.where(occ_t == 2)[0]
+    somos = np.where(occ_t == 1)[0]
+    if len(somos) != 2:
+        raise RuntimeError("triplet ROHF did not give two singly occupied "
+                           f"orbitals (found {len(somos)}); cannot build a "
+                           "broken-symmetry singlet guess from it")
+    nocc = mol.nelectron // 2
+    if len(doubly) + 1 != nocc:
+        raise RuntimeError(f"triplet ROHF has {len(doubly)} doubly occupied "
+                           f"orbitals, expected {nocc - 1} for a singlet with "
+                           f"{mol.nelectron} electrons")
+    occ_a = np.zeros(mo.shape[1])
+    occ_b = np.zeros(mo.shape[1])
+    occ_a[doubly] = 1.0
+    occ_b[doubly] = 1.0
+    occ_a[somos[0]] = 1.0               # one unpaired electron to alpha
+    occ_b[somos[1]] = 1.0               # the other to beta
+    dm0 = scf.uhf.make_rdm1((mo, mo), (occ_a, occ_b))
     if verbose:
-        state = "converged" if mf_t.converged else "NOT CONVERGED"
-        print(f"Triplet ROHF guess: E(triplet) = {mf_t.e_tot:.9f} "
-              f"({state}); handing its spin-polarized density to the "
-              f"singlet UHF")
-    if dm.ndim != 3 or dm.shape[0] != 2:
-        raise RuntimeError("triplet ROHF did not return an (alpha, beta) "
-                           f"density (got shape {dm.shape})")
-    return dm
+        print(f"Triplet ROHF guess [orbitals]: E(triplet) = {mf_t.e_tot:.9f} "
+              f"({state})")
+        print(f"Triplet ROHF guess [orbitals]: {len(doubly)} doubly occupied "
+              f"plus MO {somos[0] + 1} to alpha and MO {somos[1] + 1} to beta "
+              f"({nocc} electrons per spin)")
+    return dm0
 
 
 def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False,
@@ -1541,6 +1577,28 @@ def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False,
     return scf.uhf.make_rdm1((Ca, Cb), (occ_a, occ_b))
 
 
+class MinPopSCFError(RuntimeError):
+    """The SCF cannot be trusted, so the run stops instead of reporting.
+
+    Raised when an SCF fails to converge, or when Stable=Opt exhausts its
+    cycles with the wavefunction still internally unstable. Both conditions
+    otherwise produce a complete, plausible-looking MinPop report built on a
+    wavefunction that is not a converged minimum, which is worse than no report
+    at all for reference data: the numbers look usable and are silently wrong.
+    """
+
+
+def _require_converged(mf, what):
+    """Stop the run unless this SCF converged."""
+    if not getattr(mf, "converged", False):
+        raise MinPopSCFError(
+            f"{what} did not converge in {mf.max_cycle} cycles "
+            f"(E = {mf.e_tot:.9f}). Populations from an unconverged "
+            f"wavefunction are not reference quality. Try a different "
+            f"-guess, -guess-triplet for an open-shell singlet, or raise "
+            f"the cycle limit.")
+
+
 def _stabilize_uhf(mf, max_cycles=10, verbose=False):
     """
     Follow internal UHF instabilities until the solution is internally stable
@@ -1577,10 +1635,13 @@ def _stabilize_uhf(mf, max_cycles=10, verbose=False):
                   f"(cycle {i})")
         dm1 = mf.make_rdm1(mo1, mf.mo_occ)
         mf.kernel(dm0=dm1)
-    if verbose:
-        print(f"Stable=Opt: WARNING still internally unstable after "
-              f"{max_cycles} cycles")
-    return mf
+        _require_converged(mf, f"Stable=Opt reoptimization (cycle {i})")
+    raise MinPopSCFError(
+        f"still internally unstable after {max_cycles} Stable=Opt cycle(s). "
+        f"The SCF is sitting on a saddle point of the orbital-rotation "
+        f"surface, so a lower broken-symmetry solution exists that this "
+        f"starting point cannot reach. Try -guess-triplet orbitals for an "
+        f"open-shell singlet, or raise -stable-cycles.")
 
 
 def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
@@ -1588,9 +1649,9 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      standard_orientation=True,
                      azimuthal_gauge=True,
                      guess='minao',
-                     guess_triplet=False,
+                     guess_triplet=None,
                      guessmix=False, guessmix_angle=45.0,
-                     stable=False, stable_cycles=10):
+                     stable=False, stable_cycles=5):
     """
     Run UHF calculation and MinPop analysis from an XYZ file.
     
@@ -1679,7 +1740,8 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     # Optional broken-symmetry HOMO-LUMO mixed initial guess (Gaussian Guess=Mix)
     dm0 = None
     if guess_triplet:
-        dm0 = _init_guess_triplet(mol, verbose=verbose)
+        dm0 = _init_guess_triplet(mol, mode=guess_triplet,
+                                  verbose=verbose)
     elif guessmix:
         dm0 = _init_guess_mixed(mol, mixing_angle_deg=guessmix_angle,
                                 verbose=verbose, seed=guess)
@@ -1701,6 +1763,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
     mf.kernel(dm0=dm0)
+    _require_converged(mf, "SCF")
 
     # Follow internal instabilities to the lower (broken-symmetry) solution
     if stable:
@@ -1913,19 +1976,24 @@ Notes:
                              "broken-symmetry state that DIIS would otherwise "
                              "relax back to the symmetric solution")
     parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
-                        default=10,
-                        help="Max stability-follow reoptimizations (default: 10)")
-    parser.add_argument("-guess-triplet", dest="guess_triplet",
-                        action="store_true",
+                        default=5,
+                        help="Max stability-follow reoptimizations (default: "
+                             "5). The run STOPS if the wavefunction is still "
+                             "internally unstable after them, rather than "
+                             "reporting populations from a saddle point.")
+    parser.add_argument("-guess-triplet", dest="guess_triplet", nargs="?",
+                        const="density", default=None,
+                        choices=["density", "orbitals"],
                         help="Singlets only: converge a triplet ROHF in the "
-                             "same basis and use its spin-polarized density as "
-                             "the UHF guess. The triplet puts the two unpaired "
-                             "electrons in different spatial orbitals, so the "
-                             "singlet UHF starts inside the broken-symmetry "
-                             "basin and needs no -guessmix. Useful for "
-                             "diradicals and near-transition-state geometries "
-                             "where a mixed guess relaxes back to the "
-                             "restricted solution.")
+                             "same basis and start the UHF from it, so no "
+                             "-guessmix is needed. 'density' (the default when "
+                             "the flag is given bare) passes the triplet's own "
+                             "alpha and beta densities, consistent with the "
+                             "-guess family. 'orbitals' instead reoccupies the "
+                             "triplet's spatial orbitals for the singlet, "
+                             "which starts from the correct electron count per "
+                             "spin and can reach broken-symmetry minima the "
+                             "density mode misses.")
     parser.add_argument("-guess", dest="guess", default="minao",
                         choices=["minao", "huckel", "vsap", "sap", "atom",
                                  "1e"],
@@ -1960,7 +2028,7 @@ Notes:
     
     args = parser.parse_args()
 
-    if args.guess_triplet:
+    if args.guess_triplet is not None:
         if args.mult != 1:
             sys.exit("-guess-triplet applies to singlets only "
                      f"(-mult 1); got -mult {args.mult}")
@@ -1976,30 +2044,42 @@ Notes:
     # The capture starts before the command echo so the exported record hashes
     # the same bytes a redirected .out receives (source.sha256 == sha of .out).
     ctx = _capture_report() if exporting else contextlib.nullcontext()
+    failure = None
     with ctx as buf:
-        # Echo the exact command as the very first line so the run is
-        # reproducible.
-        if not args.quiet:
-            print("Command line: python "
-                  + " ".join(shlex.quote(a) for a in sys.argv))
+        try:
+            # Echo the exact command as the very first line so the run is
+            # reproducible.
+            if not args.quiet:
+                print("Command line: python "
+                      + " ".join(shlex.quote(a) for a in sys.argv))
 
-        run_uhf_from_xyz(
-            args.xyz_file,
-            charge=args.charge,
-            multiplicity=args.mult,
-            basis=args.basis,
-            ecp=args.ecp,
-            verbose=not args.quiet,
-            basis_dir=args.basis_dir,
-            standard_orientation=args.standard_orientation,
-            azimuthal_gauge=args.azimuthal_gauge,
-            guess=args.guess,
-            guess_triplet=args.guess_triplet,
-            guessmix=args.guessmix,
-            guessmix_angle=args.guessmix_angle,
-            stable=args.stable,
-            stable_cycles=args.stable_cycles
-        )
+            run_uhf_from_xyz(
+                args.xyz_file,
+                charge=args.charge,
+                multiplicity=args.mult,
+                basis=args.basis,
+                ecp=args.ecp,
+                verbose=not args.quiet,
+                basis_dir=args.basis_dir,
+                standard_orientation=args.standard_orientation,
+                azimuthal_gauge=args.azimuthal_gauge,
+                guess=args.guess,
+                guess_triplet=args.guess_triplet,
+                guessmix=args.guessmix,
+                guessmix_angle=args.guessmix_angle,
+                stable=args.stable,
+                stable_cycles=args.stable_cycles
+            )
+        except MinPopSCFError as exc:
+            failure = exc
+
+
+    if failure is not None:
+        # No export: there is no trustworthy result to serialize. The partial
+        # report still reaches stdout so the redirected .out shows how far the
+        # run got.
+        print(f"MinPop ERROR: {failure}", file=sys.stderr)
+        sys.exit(1)
 
     if exporting:
         _export_outputs(buf.getvalue(), args)

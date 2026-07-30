@@ -1070,6 +1070,25 @@ def _apply_azimuthal_gauge(dm_list, ao_labels, coords_bohr,
     return out, theta
 
 
+class MinPopSCFError(RuntimeError):
+    """The SCF cannot be trusted, so the run stops instead of reporting.
+
+    An unconverged SCF still produces a complete, plausible-looking MinPop
+    report built on a wavefunction that is not a minimum, which is worse than
+    no report at all for reference data: the numbers look usable and are
+    silently wrong.
+    """
+
+
+def _require_converged(mf, what):
+    """Stop the run unless this SCF converged."""
+    if not getattr(mf, "converged", False):
+        raise MinPopSCFError(
+            f"{what} did not converge in {mf.max_cycle} cycles "
+            f"(E = {mf.e_tot:.9f}). Populations from an unconverged "
+            f"wavefunction are not reference quality. Try a different -guess.")
+
+
 def minpop_rohf(mf, verbose=True, azimuthal_gauge=True):
     """
     Perform MinPop population analysis on a converged ROHF calculation.
@@ -1290,6 +1309,7 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
     mf.kernel(dm0=dm0)
+    _require_converged(mf, "SCF")
     
     if verbose:
         print()
@@ -1503,25 +1523,34 @@ Notes:
     # The capture starts before the command echo so the exported record hashes
     # the same bytes a redirected .out receives (source.sha256 == sha of .out).
     ctx = _capture_report() if exporting else contextlib.nullcontext()
+    failure = None
     with ctx as buf:
-        # Echo the exact command as the very first line so the run is
-        # reproducible.
-        if not args.quiet:
-            print("Command line: python "
-                  + " ".join(shlex.quote(a) for a in sys.argv))
+        try:
+            # Echo the exact command as the very first line so the run is
+            # reproducible.
+            if not args.quiet:
+                print("Command line: python "
+                      + " ".join(shlex.quote(a) for a in sys.argv))
 
-        run_rohf_from_xyz(
-            args.xyz_file,
-            charge=args.charge,
-            multiplicity=args.mult,
-            basis=args.basis,
-            ecp=args.ecp,
-            verbose=not args.quiet,
-            basis_dir=args.basis_dir,
-            standard_orientation=args.standard_orientation,
-            azimuthal_gauge=args.azimuthal_gauge,
-            guess=args.guess
-        )
+            run_rohf_from_xyz(
+                args.xyz_file,
+                charge=args.charge,
+                multiplicity=args.mult,
+                basis=args.basis,
+                ecp=args.ecp,
+                verbose=not args.quiet,
+                basis_dir=args.basis_dir,
+                standard_orientation=args.standard_orientation,
+                azimuthal_gauge=args.azimuthal_gauge,
+                guess=args.guess
+            )
+        except MinPopSCFError as exc:
+            failure = exc
+
+
+    if failure is not None:
+        print(f"MinPop ERROR: {failure}", file=sys.stderr)
+        sys.exit(1)
 
     if exporting:
         _export_outputs(buf.getvalue(), args)
