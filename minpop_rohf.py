@@ -1207,7 +1207,8 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True):
 
 def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                       ecp=None, verbose=True, basis_dir=None,
-                      standard_orientation=True, azimuthal_gauge=True):
+                      standard_orientation=True, azimuthal_gauge=True,
+                      guess='minao'):
     """
     Run ROHF calculation and MinPop analysis from an XYZ file.
     
@@ -1285,7 +1286,10 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     mf.conv_tol_grad = 1e-6
     mf.diis_space = 8
     mf.level_shift = 0.0
-    mf.kernel()
+    dm0 = mf.get_init_guess(key=guess) if guess != 'minao' else None
+    if verbose and guess != 'minao':
+        print(f"Initial guess: {guess}")
+    mf.kernel(dm0=dm0)
     
     if verbose:
         print()
@@ -1461,6 +1465,10 @@ Notes:
                              "Gaussian's standard orientation). By default the "
                              "geometry is rotated into Gaussian's frame via "
                              "gaussian_standard_orientation.py")
+    parser.add_argument("-guess", dest="guess", default="minao",
+                        choices=["minao", "huckel", "vsap", "sap", "atom",
+                                 "1e"],
+                        help="SCF initial guess (default: minao).")
     parser.add_argument("-json", dest="json_path", metavar="PATH",
                         default=None,
                         help="Also serialize this run to a JSON record via "
@@ -1511,7 +1519,8 @@ Notes:
             verbose=not args.quiet,
             basis_dir=args.basis_dir,
             standard_orientation=args.standard_orientation,
-            azimuthal_gauge=args.azimuthal_gauge
+            azimuthal_gauge=args.azimuthal_gauge,
+            guess=args.guess
         )
 
     if exporting:

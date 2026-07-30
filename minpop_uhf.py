@@ -1402,7 +1402,8 @@ def minpop_uhf(mf, verbose=True, azimuthal_gauge=True):
     return results
 
 
-def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
+def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False,
+                      seed='minao'):
     """
     Broken-symmetry UHF initial guess by HOMO-LUMO mixing (Gaussian Guess=Mix).
 
@@ -1444,7 +1445,11 @@ def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False):
     ref = scf.RHF(mol) if mol.spin == 0 else scf.ROHF(mol)
     s1e = ref.get_ovlp()
     h1e = ref.get_hcore()
-    dm_guess = ref.get_init_guess(mol)
+    # The seed decides which frontier orbitals get mixed, so it changes
+    # which basin the broken-symmetry SCF falls into, not just how fast it
+    # gets there. 'huckel' is the useful alternative when the minao-seeded
+    # mix stalls or lands on a higher stationary point.
+    dm_guess = ref.get_init_guess(mol, key=seed)
     fock = ref.get_fock(h1e=h1e, s1e=s1e,
                         vhf=ref.get_veff(mol, dm_guess), dm=dm_guess)
     mo_energy, mo = ref.eig(fock, s1e)
@@ -1520,6 +1525,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      ecp=None, verbose=True, basis_dir=None,
                      standard_orientation=True,
                      azimuthal_gauge=True,
+                     guess='minao',
                      guessmix=False, guessmix_angle=45.0,
                      stable=False, stable_cycles=10):
     """
@@ -1611,7 +1617,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     dm0 = None
     if guessmix:
         dm0 = _init_guess_mixed(mol, mixing_angle_deg=guessmix_angle,
-                                verbose=verbose)
+                                verbose=verbose, seed=guess)
     elif mol.spin == 0:
         # Plain UHF on a closed-shell singlet has to collapse onto the
         # restricted solution, and Gaussian duly prints spin densities of
@@ -1623,8 +1629,12 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         # density keeps them identical through every iteration, so the spin
         # density comes out identically zero. -guessmix takes precedence, since
         # breaking that symmetry on purpose is the whole point of Guess=Mix.
-        _dm_restricted = scf.hf.get_init_guess(mol, 'minao')
+        _dm_restricted = scf.hf.get_init_guess(mol, guess)
         dm0 = np.array([_dm_restricted * 0.5, _dm_restricted * 0.5])
+    elif guess != 'minao':
+        dm0 = mf.get_init_guess(key=guess)
+    if verbose and guess != 'minao':
+        print(f"Initial guess: {guess}")
     mf.kernel(dm0=dm0)
 
     # Follow internal instabilities to the lower (broken-symmetry) solution
@@ -1840,6 +1850,14 @@ Notes:
     parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
                         default=10,
                         help="Max stability-follow reoptimizations (default: 10)")
+    parser.add_argument("-guess", dest="guess", default="minao",
+                        choices=["minao", "huckel", "vsap", "sap", "atom",
+                                 "1e"],
+                        help="SCF initial guess (default: minao). With "
+                             "-guessmix this seeds the density whose frontier "
+                             "orbitals are mixed, so it selects the "
+                             "broken-symmetry basin; 'huckel' is worth trying "
+                             "when a minao-seeded mix fails to converge.")
     parser.add_argument("-json", dest="json_path", metavar="PATH",
                         default=None,
                         help="Also serialize this run to a JSON record via "
@@ -1891,6 +1909,7 @@ Notes:
             basis_dir=args.basis_dir,
             standard_orientation=args.standard_orientation,
             azimuthal_gauge=args.azimuthal_gauge,
+            guess=args.guess,
             guessmix=args.guessmix,
             guessmix_angle=args.guessmix_angle,
             stable=args.stable,
