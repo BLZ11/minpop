@@ -1402,6 +1402,68 @@ def minpop_uhf(mf, verbose=True, azimuthal_gauge=True):
     return results
 
 
+def _init_guess_triplet(mol, conv_tol=1e-9, max_cycle=128, verbose=False):
+    """Broken-symmetry singlet guess from a converged triplet ROHF.
+
+    For an open-shell singlet (a diradical, or a stretched bond near a
+    transition state) the restricted solution is a poor place to start: HOMO
+    and LUMO are nearly degenerate, so a mixed guess can relax straight back to
+    the symmetric stationary point and the SCF settles on an answer that is not
+    the UHF minimum. A triplet ROHF in the SAME basis converges readily and
+    puts the two unpaired electrons in different spatial orbitals, so its alpha
+    and beta densities genuinely differ. Handing that pair to the singlet UHF
+    starts the SCF inside the broken-symmetry basin from the first iteration,
+    with no orbital rotation involved, which is why it needs no -guessmix.
+
+    The triplet only supplies a density. It carries the triplet's alpha and
+    beta electron counts (N/2+1 and N/2-1); the singlet UHF reoccupies to equal
+    counts on its first diagonalization and keeps the spin polarization built
+    into the orbitals.
+
+    Parameters
+    ----------
+    mol : pyscf.gto.Mole
+        The SINGLET target (charge and spin already set, spin must be 0).
+    conv_tol, max_cycle : optional
+        Convergence controls for the triplet ROHF.
+    verbose : bool, optional
+        Print the triplet energy for provenance.
+
+    Returns
+    -------
+    dm0 : ndarray, shape (2, nao, nao)
+        Spin-polarized initial density for the singlet scf.UHF.
+    """
+    if mol.spin != 0:
+        raise ValueError("triplet guess applies to singlets only "
+                         f"(got spin={mol.spin}, i.e. multiplicity "
+                         f"{mol.spin + 1})")
+    mol_t = mol.copy()
+    mol_t.spin = 2                      # 2S, i.e. a triplet
+    mol_t.build(False, False)           # same basis, charge and ECP
+    # Keep the scaffold silent. This ROHF is a guess generator, not a result,
+    # and letting PySCF print its own convergence verdict would put
+    # "SCF not converged." into the report for a run whose real singlet SCF
+    # converged perfectly well, which downstream status checks read as a
+    # failure. The explicit line below records the triplet's outcome instead.
+    mol_t.verbose = 0
+    mf_t = scf.ROHF(mol_t)
+    mf_t.verbose = 0
+    mf_t.max_cycle = max_cycle
+    mf_t.conv_tol = conv_tol
+    mf_t.kernel()
+    dm = np.asarray(mf_t.make_rdm1())
+    if verbose:
+        state = "converged" if mf_t.converged else "NOT CONVERGED"
+        print(f"Triplet ROHF guess: E(triplet) = {mf_t.e_tot:.9f} "
+              f"({state}); handing its spin-polarized density to the "
+              f"singlet UHF")
+    if dm.ndim != 3 or dm.shape[0] != 2:
+        raise RuntimeError("triplet ROHF did not return an (alpha, beta) "
+                           f"density (got shape {dm.shape})")
+    return dm
+
+
 def _init_guess_mixed(mol, mixing_angle_deg=45.0, verbose=False,
                       seed='minao'):
     """
@@ -1526,6 +1588,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      standard_orientation=True,
                      azimuthal_gauge=True,
                      guess='minao',
+                     guess_triplet=False,
                      guessmix=False, guessmix_angle=45.0,
                      stable=False, stable_cycles=10):
     """
@@ -1615,7 +1678,9 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 
     # Optional broken-symmetry HOMO-LUMO mixed initial guess (Gaussian Guess=Mix)
     dm0 = None
-    if guessmix:
+    if guess_triplet:
+        dm0 = _init_guess_triplet(mol, verbose=verbose)
+    elif guessmix:
         dm0 = _init_guess_mixed(mol, mixing_angle_deg=guessmix_angle,
                                 verbose=verbose, seed=guess)
     elif mol.spin == 0:
@@ -1850,6 +1915,17 @@ Notes:
     parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
                         default=10,
                         help="Max stability-follow reoptimizations (default: 10)")
+    parser.add_argument("-guess-triplet", dest="guess_triplet",
+                        action="store_true",
+                        help="Singlets only: converge a triplet ROHF in the "
+                             "same basis and use its spin-polarized density as "
+                             "the UHF guess. The triplet puts the two unpaired "
+                             "electrons in different spatial orbitals, so the "
+                             "singlet UHF starts inside the broken-symmetry "
+                             "basin and needs no -guessmix. Useful for "
+                             "diradicals and near-transition-state geometries "
+                             "where a mixed guess relaxes back to the "
+                             "restricted solution.")
     parser.add_argument("-guess", dest="guess", default="minao",
                         choices=["minao", "huckel", "vsap", "sap", "atom",
                                  "1e"],
@@ -1884,6 +1960,14 @@ Notes:
     
     args = parser.parse_args()
 
+    if args.guess_triplet:
+        if args.mult != 1:
+            sys.exit("-guess-triplet applies to singlets only "
+                     f"(-mult 1); got -mult {args.mult}")
+        if args.guessmix:
+            sys.exit("-guess-triplet and -guessmix are two different ways to "
+                     "reach the broken-symmetry solution; pick one")
+
     exporting = bool(args.json_path or args.csv_long)
     if exporting and args.quiet:
         print("[export] note: -q suppresses the report the exports are parsed "
@@ -1910,6 +1994,7 @@ Notes:
             standard_orientation=args.standard_orientation,
             azimuthal_gauge=args.azimuthal_gauge,
             guess=args.guess,
+            guess_triplet=args.guess_triplet,
             guessmix=args.guessmix,
             guessmix_angle=args.guessmix_angle,
             stable=args.stable,
