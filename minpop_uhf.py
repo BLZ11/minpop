@@ -1613,7 +1613,8 @@ def _require_converged(mf, what):
             f"the cycle limit.")
 
 
-def _stabilize_uhf(mf, max_cycles=10, verbose=False):
+def _stabilize_uhf(mf, max_cycles=10, verbose=False,
+                   newton_fallback=True):
     """
     Follow internal UHF instabilities until the solution is internally stable
     (analogous to Gaussian's Stable=Opt).
@@ -1649,6 +1650,18 @@ def _stabilize_uhf(mf, max_cycles=10, verbose=False):
                   f"(cycle {i})")
         dm1 = mf.make_rdm1(mo1, mf.mo_occ)
         mf.kernel(dm0=dm1)
+        if not mf.converged and newton_fallback:
+            # The surface just past an instability rotation is flat, and DIIS
+            # can crawl along it for hundreds of iterations without meeting the
+            # tolerance. The second-order solver descends it in a handful of
+            # steps, so try that before declaring the run lost.
+            if verbose:
+                print(f"Stable=Opt: DIIS did not converge on cycle {i}; "
+                      f"retrying with the second-order (Newton) solver")
+            conv_tol = mf.conv_tol
+            mf = mf.newton()
+            mf.conv_tol = conv_tol
+            mf.kernel(dm0=dm1)
         _require_converged(mf, f"Stable=Opt reoptimization (cycle {i})")
     raise MinPopSCFError(
         f"still internally unstable after {max_cycles} Stable=Opt cycle(s). "
@@ -1665,7 +1678,9 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      guess='minao',
                      guess_triplet=None,
                      guessmix=False, guessmix_angle=45.0,
-                     stable=False, stable_cycles=5):
+                     stable=False, stable_cycles=5, max_cycle=128,
+                     soscf=False, newton_fallback=True,
+                     newton_conv_tol=1e-11):
     """
     Run UHF calculation and MinPop analysis from an XYZ file.
     
@@ -1745,7 +1760,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 
     # SCF with Gaussian-like defaults
     mf = scf.UHF(mol)
-    mf.max_cycle = 128
+    mf.max_cycle = max_cycle
     mf.conv_tol = 1e-9
     mf.conv_tol_grad = 1e-6
     mf.diis_space = 8
@@ -1776,12 +1791,37 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         dm0 = mf.get_init_guess(key=guess)
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
+    if soscf:
+        # Second-order from the outset instead of only as a rescue. Costs more
+        # per iteration than DIIS but descends flat broken-symmetry surfaces
+        # that DIIS oscillates on, so it can be the difference between a run
+        # that finishes and one that stalls at the right energy.
+        if verbose:
+            print("SCF: second-order (Newton) solver from the start (-soscf)")
+        _conv, _mx = mf.conv_tol, mf.max_cycle
+        mf = mf.newton()
+        mf.conv_tol, mf.max_cycle = _conv, _mx
+
     mf.kernel(dm0=dm0)
+    if not mf.converged and newton_fallback and not soscf:
+        # DIIS can oscillate around a broken-symmetry solution without ever
+        # meeting the tolerance: the energy sits at the right value while the
+        # gradient refuses to fall. The second-order solver closes that gap in
+        # a few steps, so try it before giving up on the run.
+        if verbose:
+            print("SCF: DIIS did not converge; retrying with the "
+                  "second-order (Newton) solver")
+        _conv = mf.conv_tol
+        mf = mf.newton()
+        mf.conv_tol = _conv
+        mf.kernel(dm0=dm0)
     _require_converged(mf, "SCF")
 
     # Follow internal instabilities to the lower (broken-symmetry) solution
     if stable:
-        mf = _stabilize_uhf(mf, max_cycles=stable_cycles, verbose=verbose)
+        mf = _stabilize_uhf(mf, max_cycles=stable_cycles,
+                            verbose=verbose,
+                            newton_fallback=newton_fallback)
 
     # Second-order (Newton) tightening. Broken-symmetry singlets sit on a very
     # flat surface, and plain DIIS at a loose gradient leaves spin-sensitive
@@ -1790,7 +1830,7 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     # MBS spin densities reproduce Gaussian.
     mo_coeff, mo_occ = mf.mo_coeff, mf.mo_occ    # converged DIIS/stability orbitals
     mf = mf.newton()
-    mf.conv_tol = 1e-11
+    mf.conv_tol = newton_conv_tol
     mf.kernel(mo_coeff, mo_occ)                   # seed Newton with the MOs, not a
     # density matrix. Passing make_rdm1() forces Newton to rebuild the orbitals by
     # diagonalizing F against the near-singular overlap (dm -> MO), which is what
@@ -1989,6 +2029,31 @@ Notes:
                              "solution (Gaussian Stable=Opt); needed to keep a "
                              "broken-symmetry state that DIIS would otherwise "
                              "relax back to the symmetric solution")
+    parser.add_argument("-soscf", dest="soscf", action="store_true",
+                        help="Use the second-order (Newton) solver for the "
+                             "main SCF from the start, rather than only as a "
+                             "rescue after DIIS fails. Slower per iteration "
+                             "but far steadier on the flat surfaces of "
+                             "broken-symmetry singlets.")
+    parser.add_argument("-no-newton-fallback", dest="newton_fallback",
+                        action="store_false", default=True,
+                        help="Do not retry a stalled DIIS solve with the "
+                             "second-order solver. The run then stops on the "
+                             "first non-convergence, which is what you want "
+                             "when reproducing an older run exactly or when "
+                             "testing whether DIIS alone can do the job.")
+    parser.add_argument("-newton-conv-tol", dest="newton_conv_tol", type=float,
+                        default=1e-11,
+                        help="Convergence tolerance for the final Newton "
+                             "tightening pass that settles the spin densities "
+                             "(default: 1e-11).")
+    parser.add_argument("-max-cycle", dest="max_cycle", type=int, default=128,
+                        help="Max SCF iterations per solve (default: 128). "
+                             "Raise it when a run stops with 'did not "
+                             "converge' while the energy and <S^2> are still "
+                             "drifting toward a sensible answer, which means "
+                             "it needed more iterations rather than a "
+                             "different starting point.")
     parser.add_argument("-stable-cycles", dest="stable_cycles", type=int,
                         default=5,
                         help="Max stability-follow reoptimizations (default: "
@@ -2082,7 +2147,11 @@ Notes:
                 guessmix=args.guessmix,
                 guessmix_angle=args.guessmix_angle,
                 stable=args.stable,
-                stable_cycles=args.stable_cycles
+                stable_cycles=args.stable_cycles,
+            max_cycle=args.max_cycle,
+            soscf=args.soscf,
+            newton_fallback=args.newton_fallback,
+            newton_conv_tol=args.newton_conv_tol
             )
         except MinPopSCFError as exc:
             failure = exc

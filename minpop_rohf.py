@@ -1227,7 +1227,7 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True):
 def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                       ecp=None, verbose=True, basis_dir=None,
                       standard_orientation=True, azimuthal_gauge=True,
-                      guess='minao'):
+                      guess='minao', max_cycle=128, soscf=False):
     """
     Run ROHF calculation and MinPop analysis from an XYZ file.
     
@@ -1300,11 +1300,20 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     
     # SCF with Gaussian-like defaults
     mf = scf.ROHF(mol)
-    mf.max_cycle = 128
+    mf.max_cycle = max_cycle
     mf.conv_tol = 1e-8
     mf.conv_tol_grad = 1e-6
     mf.diis_space = 8
     mf.level_shift = 0.0
+    if soscf:
+        # ROHF has no stability loop and no automatic rescue, so the
+        # second-order solver is opt-in only. It costs more per iteration and
+        # earns that back on geometries where DIIS will not settle.
+        if verbose:
+            print("SCF: second-order (Newton) solver from the start (-soscf)")
+        _conv, _mx = mf.conv_tol, mf.max_cycle
+        mf = mf.newton()
+        mf.conv_tol, mf.max_cycle = _conv, _mx
     dm0 = mf.get_init_guess(key=guess) if guess != 'minao' else None
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
@@ -1485,6 +1494,12 @@ Notes:
                              "Gaussian's standard orientation). By default the "
                              "geometry is rotated into Gaussian's frame via "
                              "gaussian_standard_orientation.py")
+    parser.add_argument("-soscf", dest="soscf", action="store_true",
+                        help="Use the second-order (Newton) solver from the "
+                             "start. ROHF has no automatic fallback, so this "
+                             "is the way to reach it.")
+    parser.add_argument("-max-cycle", dest="max_cycle", type=int, default=128,
+                        help="Max SCF iterations (default: 128).")
     parser.add_argument("-guess", dest="guess", default="minao",
                         choices=["minao", "huckel", "vsap", "sap", "atom",
                                  "1e"],
@@ -1542,7 +1557,9 @@ Notes:
                 basis_dir=args.basis_dir,
                 standard_orientation=args.standard_orientation,
                 azimuthal_gauge=args.azimuthal_gauge,
-                guess=args.guess
+                guess=args.guess,
+            max_cycle=args.max_cycle,
+            soscf=args.soscf
             )
         except MinPopSCFError as exc:
             failure = exc
