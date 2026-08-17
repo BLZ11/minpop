@@ -1680,7 +1680,8 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                      guessmix=False, guessmix_angle=45.0,
                      stable=False, stable_cycles=5, max_cycle=128,
                      soscf=False, newton_fallback=True,
-                     newton_conv_tol=1e-11):
+                     newton_conv_tol=1e-11,
+                     cartesian=False):
     """
     Run UHF calculation and MinPop analysis from an XYZ file.
     
@@ -1694,6 +1695,14 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         Spin multiplicity 2S+1 (default: 1)
     basis : str, optional
         Basis set (default: '6-31+G')
+    cartesian : bool, optional
+        Use Cartesian (6D/10F) angular functions for the COMPUTATIONAL basis
+        instead of spherical (5D/7F). Default False (spherical), matching the
+        original behaviour. Gaussian's convention is per-basis: 6-31G* and the
+        6-31G family are defined 6D, while the 6-311G family, Gen input and
+        cc-pVnZ default to 5D 7F. Set True to match a Gaussian 6-31G* job.
+        The MBS minimal basis stays spherical regardless: Gaussian's MinPop
+        uses a spherical minimal basis throughout (verified vs Gaussian).
     ecp : str or dict, optional
         ECP specification. If None, auto-detects for def2 basis sets
         with heavy elements (Z > 36)
@@ -1738,13 +1747,15 @@ def run_uhf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         basis=basis_obj,
         charge=charge,
         spin=multiplicity - 1,
-        ecp=ecp
+        ecp=ecp,
+        cart=cartesian
     )
     
     if verbose:
         print(f"Molecule: {xyz_file}")
         print(f"Charge: {charge}, Multiplicity: {multiplicity}")
-        print(f"Basis: {_basis_label(basis_obj)}")
+        print(f"Basis: {_basis_label(basis_obj)} "
+              f"({'6D/10F Cartesian' if cartesian else '5D/7F spherical'})")
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
         if orient_table:
             print()
@@ -2000,6 +2011,16 @@ Notes:
     parser.add_argument("-basis-dir", dest="basis_dir", default=None,
                         help="Directory to search for custom basis modules "
                              "(cbsb3_basis_pyscf.py / cbsb7_basis_pyscf.py)")
+    parser.add_argument("-cartesian", "-cart", dest="cartesian",
+                        action="store_true", default=False,
+                        help="Use Cartesian (6D/10F) angular functions for the "
+                             "computational basis; matches Gaussian for the "
+                             "6-31G family (6-31G* is defined 6D)")
+    parser.add_argument("-spherical", "-sph", dest="cartesian",
+                        action="store_false",
+                        help="Use spherical (5D/7F) angular functions "
+                             "(default; matches Gen input, the 6-311G family "
+                             "and cc-pVnZ)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
     parser.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge",
@@ -2151,7 +2172,8 @@ Notes:
             max_cycle=args.max_cycle,
             soscf=args.soscf,
             newton_fallback=args.newton_fallback,
-            newton_conv_tol=args.newton_conv_tol
+            newton_conv_tol=args.newton_conv_tol,
+            cartesian=args.cartesian
             )
         except MinPopSCFError as exc:
             failure = exc
