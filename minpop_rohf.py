@@ -244,27 +244,43 @@ def _is_transition_metal(atomic_number):
     return any(low <= atomic_number <= high for low, high in TRANSITION_METAL_RANGES)
 
 
-def _build_minimal_basis_mol(mol):
+def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     """
-    Construct minimal basis molecule matching Gaussian's MinPop convention.
+    Construct minimal basis molecule for the MinPop projection.
     
     Parameters
     ----------
     mol : pyscf.gto.Mole
         Input molecule in extended basis set
+    minimal_basis : str, optional
+        Projection target: 'sto-3g' (default; Gaussian's MBS convention,
+        with STO-3G* on second-row elements) or 'minao'. For CHNOF the two
+        share the same shell structure (1s / 1s2s2p), so all downstream
+        Gaussian-ordering logic applies unchanged; MINAO projection with
+        transition metals present should be re-validated before use.
         
     Returns
     -------
     mol_min : pyscf.gto.Mole
-        Molecule with minimal basis set (STO-3G or STO-3G*)
+        Molecule with minimal basis set
         
     Notes
     -----
-    - Second-row elements (Na–Ar) use STO-3G* with Cartesian d-orbitals (6D)
-    - Transition metals use STO-3G with spherical d-orbitals (5D)
-    - Mixed systems default to spherical when transition metals are present
+    - STO-3G branch: second-row elements (Na–Ar) use STO-3G* with Cartesian
+      d-orbitals (6D); transition metals use STO-3G (5D); the minimal basis
+      itself is always built spherical (Gaussian MinPop convention).
+    - MINAO branch: PySCF's MINAO on every atom, spherical.
     """
     from pyscf.data import elements
+    
+    if minimal_basis.lower().replace('-', '') == 'minao':
+        return gto.M(
+            atom=mol.atom,
+            basis={mol.atom_symbol(i): 'minao' for i in range(mol.natm)},
+            charge=mol.charge,
+            spin=mol.spin,
+            cart=False
+        )
     
     has_second_row = False
     has_transition_metal = False
@@ -1089,7 +1105,8 @@ def _require_converged(mf, what):
             f"wavefunction are not reference quality. Try a different -guess.")
 
 
-def minpop_rohf(mf, verbose=True, azimuthal_gauge=True):
+def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
+                minimal_basis='sto-3g'):
     """
     Perform MinPop population analysis on a converged ROHF calculation.
     
@@ -1121,7 +1138,11 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True):
     >>> print(f"Carbon charge: {results['mulliken_charges'][0]:.4f}")
     """
     mol = mf.mol
-    mol_min = _build_minimal_basis_mol(mol)
+    mol_min = _build_minimal_basis_mol(mol, minimal_basis=minimal_basis)
+    if verbose:
+        tag = ('MINAO' if minimal_basis.lower().replace('-', '') == 'minao'
+               else 'STO-3G (Gaussian MBS convention)')
+        print(f" Minimal-basis projection: {tag}")
     
     # Compute overlap matrices
     S_cross = intor_cross('int1e_ovlp', mol_min, mol)
@@ -1228,7 +1249,8 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                       ecp=None, verbose=True, basis_dir=None,
                       standard_orientation=True, azimuthal_gauge=True,
                       guess='minao', max_cycle=128, soscf=False,
-                      cartesian=False):
+                      cartesian=False,
+                      minimal_basis='sto-3g'):
     """
     Run ROHF calculation and MinPop analysis from an XYZ file.
     
@@ -1250,6 +1272,9 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         cc-pVnZ default to 5D 7F. Set True to match a Gaussian 6-31G* job.
         The MBS minimal basis stays spherical regardless: Gaussian's MinPop
         uses a spherical minimal basis throughout (verified vs Gaussian).
+    minimal_basis : str, optional
+        Minimal-basis projection target: 'sto-3g' (default, Gaussian's MBS
+        convention) or 'minao'.
     ecp : str or dict, optional
         ECP specification. If None, auto-detects for def2 basis sets
         with heavy elements (Z > 36)
@@ -1334,7 +1359,8 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose:
         print()
     
-    return minpop_rohf(mf, verbose=verbose, azimuthal_gauge=azimuthal_gauge)
+    return minpop_rohf(mf, verbose=verbose, azimuthal_gauge=azimuthal_gauge,
+                       minimal_basis=minimal_basis)
 
 
 # =============================================================================
@@ -1499,6 +1525,10 @@ Notes:
                         help="Use spherical (5D/7F) angular functions "
                              "(default; matches Gen input, the 6-311G family "
                              "and cc-pVnZ)")
+    parser.add_argument("-minimal-basis", "-mbs", dest="minimal_basis",
+                        choices=["sto-3g", "minao"], default="sto-3g",
+                        help="Minimal-basis projection target (default: "
+                             "sto-3g, Gaussian's MBS convention)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
     parser.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge",
@@ -1581,7 +1611,8 @@ Notes:
                 guess=args.guess,
             max_cycle=args.max_cycle,
             soscf=args.soscf,
-            cartesian=args.cartesian
+            cartesian=args.cartesian,
+            minimal_basis=args.minimal_basis
             )
         except MinPopSCFError as exc:
             failure = exc
