@@ -1371,6 +1371,23 @@ def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
     mf.kernel(dm0=dm0)
+    if not mf.converged and not soscf:
+        # DIIS oscillates when the HOMO-LUMO gap is small, which a pure GGA
+        # gives at transition-state geometries. The second-order solver,
+        # seeded with the DIIS orbitals, reaches the same stationary point:
+        # the same rescue the IAO step of run_bond_analysis.py uses, so both
+        # PySCF codes converge the same cases and the campaign's energy
+        # cross-check still compares like with like.
+        if verbose:
+            print("SCF: DIIS did not converge; retrying with the "
+                  "second-order (Newton) solver")
+        _conv, _mx = mf.conv_tol, mf.max_cycle
+        mo, occ = mf.mo_coeff, mf.mo_occ
+        mf = mf.newton()
+        # its own budget, as in run_bond_analysis.py: a DIIS cap is not a
+        # sensible limit for the second-order stage
+        mf.conv_tol, mf.max_cycle = _conv, max(_mx, 100)
+        mf.kernel(mo, occ)
     _require_converged(mf, "SCF")
     
     if verbose:
