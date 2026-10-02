@@ -1100,6 +1100,34 @@ class MinPopSCFError(RuntimeError):
     """
 
 
+def aufbau_violation(mf):
+    """None if the converged closed-shell density fills the lowest orbitals of
+    its own Fock matrix; otherwise (holes, particles), 1-based orbital indices
+    in energy order.
+
+    Built from the density, not from the solver's orbital energies, so it
+    holds for any route to convergence. DIIS fills aufbau at every step and
+    passes by construction. A second-order solve keeps whatever occupation it
+    starts from and can converge with an occupied orbital above an empty one,
+    a state the internal stability test cannot see because it only rotates
+    orbitals at fixed occupation. At transition-state geometries where PBE in
+    a minimal basis has no closed-shell aufbau solution at all, every
+    converged integer-occupation solution fails this test.
+    """
+    import scipy.linalg as _sl
+    dm = mf.make_rdm1()
+    if getattr(dm, "ndim", 2) != 2:          # open-shell: not tested here
+        return None
+    S = mf.get_ovlp()
+    e, C = _sl.eigh(mf.get_fock(dm=dm), S)
+    nocc = mf.mol.nelectron // 2
+    w = np.einsum("pi,pq,qr,rs,si->i", C, S, dm, S, C) / 2
+    holes = [i + 1 for i in range(nocc) if w[i] < 0.5]
+    if not holes:
+        return None
+    return holes, [i + 1 for i in range(nocc, len(e)) if w[i] > 0.5]
+
+
 def _require_converged(mf, what):
     """Stop the run unless this SCF converged."""
     if not getattr(mf, "converged", False):
@@ -1389,6 +1417,13 @@ def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         mf.conv_tol, mf.max_cycle = _conv, max(_mx, 100)
         mf.kernel(mo, occ)
     _require_converged(mf, "SCF")
+    bad = aufbau_violation(mf)
+    if bad:
+        raise MinPopSCFError(
+            f"SCF converged to a non-aufbau solution (orbital(s) {bad[0]} "
+            f"empty, {bad[1]} occupied): no closed-shell ground state was "
+            f"found at this geometry (E = {mf.e_tot:.9f}). Populations from it "
+            f"would describe an excited configuration.")
     
     if verbose:
         print()
