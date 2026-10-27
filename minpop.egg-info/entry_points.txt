@@ -1,7 +1,0 @@
-[console_scripts]
-minpop-export = minpop.minpop_json_csv:main
-minpop-gvbpp = minpop.minpop_gvbpp:main
-minpop-rks = minpop.minpop_rks:main
-minpop-rohf = minpop.minpop_rohf:main
-minpop-uhf = minpop.minpop_uhf:main
-minpop-uks = minpop.minpop_uks:main
