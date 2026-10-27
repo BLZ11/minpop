@@ -1,0 +1,7 @@
+numpy>=1.20
+scipy>=1.6
+pyscf>=2.3
+# optional, for minpop_gvbpp.py:
+#   git clone https://github.com/keithgroup/gvbpp.git && pip install ./gvbpp
+# optional, only to re-verify the ANO-RCC truncations against Basis Set Exchange:
+#   basis-set-exchange

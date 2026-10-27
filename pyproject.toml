@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minpop"
+version = "2.0.0"
+description = "Minimal-basis (MBS) Mulliken population analysis in PySCF: HF, DFT and GVB-PP references, ANO-RCC-MB for the whole periodic table, sigma/pi/delta/phi bond populations"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Barbaro Zulueta" }]
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.20", "scipy>=1.6", "pyscf>=2.3"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+[project.optional-dependencies]
+gvb = ["gvbpp @ git+https://github.com/keithgroup/gvbpp.git"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/BLZ11/minpop"
+
+[project.scripts]
+minpop-rohf  = "minpop.minpop_rohf:main"
+minpop-uhf   = "minpop.minpop_uhf:main"
+minpop-rks   = "minpop.minpop_rks:main"
+minpop-uks   = "minpop.minpop_uks:main"
+minpop-gvbpp = "minpop.minpop_gvbpp:main"
+minpop-export = "minpop.minpop_json_csv:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["minpop", "minpop.basis_sets"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

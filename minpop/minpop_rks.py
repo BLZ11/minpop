@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Minimum Population (MinPop) Localization Analysis for ROHF Wavefunctions.
+Minimum Population (MinPop) Localization Analysis for RKS (KS-DFT) Wavefunctions.
+Identical to minpop_rohf.py except the SCF is restricted Kohn-Sham (RKS)
+with a user-selectable functional (-xc, default pbe). RKS rather than ROKS
+because restricted-open KS is numerically unstable; use minpop_uks.py for
+open shells.
 
 This module projects Restricted Open-shell Hartree-Fock (ROHF) molecular orbitals
 onto a minimal basis set for chemically intuitive population analysis. Output
@@ -53,12 +57,19 @@ import re
 import shlex
 import sys
 import numpy as np
-from pyscf import gto, scf
+from pyscf import gto, scf, dft
 from pyscf.gto import intor_cross
+
+# Make the sibling modules (bond_symmetry, basis modules, minpop_json_csv, ...)
+# importable whether this file runs as a script or as part of the minpop package.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _d in (_HERE, os.path.join(_HERE, "basis_sets")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 __version__ = "1.1.0"
 __author__ = "Barbaro Zulueta"
-__all__ = ["minpop_rohf", "run_rohf_from_xyz"]
+__all__ = ["minpop_rks", "run_rks_from_xyz"]
 
 
 # =============================================================================
@@ -85,7 +96,40 @@ TRANSITION_METAL_RANGES = [(21, 30), (39, 48), (57, 80), (89, 112)]
 CUSTOM_BASIS_MODULES = {
     'cbsb3': ('cbsb3_basis_pyscf', 'CBSB3'),
     'cbsb7': ('cbsb7_basis_pyscf', 'CBSB7'),
+    # ANO-RCC truncations, sliced from PySCF's built-in ANO-RCC general
+    # contraction by anorcc_basis_pyscf.py (all-electron, DKH2-contracted;
+    # pair with -x2c for heavy atoms).
+    'anorccmb':   ('anorcc_basis_pyscf', 'ANO_RCC_MB'),
+    'anorccvdzp': ('anorcc_basis_pyscf', 'ANO_RCC_VDZP'),
+    'anorccvtzp': ('anorcc_basis_pyscf', 'ANO_RCC_VTZP'),
+    'anorccvqzp': ('anorcc_basis_pyscf', 'ANO_RCC_VQZP'),
 }
+
+# Minimal-basis projection targets accepted by -minimal-basis.
+MINIMAL_BASIS_CHOICES = ('sto-3g', 'minao', 'ano-rcc-mb', 'sto-3g-ano')
+
+# Heaviest element with an STO-3G definition (Xe). Beyond it 'sto-3g-ano'
+# switches to ANO-RCC-MB, the only all-electron minimal basis available.
+STO3G_MAX_Z = 54
+
+# AO label numbering for the generic (ano-rcc-mb / sto-3g-ano) ordering path.
+# 'physical' (default): principal quantum number (Pt 5D, 6S, 4F).
+# 'gaussian': running shell counter per atom as Gaussian prints it (9D, 10S,
+# 7F), meaningful only up to Xe. The legacy STO-3G path always prints
+# Gaussian's labels. Labels only; numbers and ordering are identical.
+LABEL_STYLE = None   # None: 'gaussian' for sto-3g / sto-3g-ano, 'physical' for ano-rcc-mb
+
+_SYMMETRY_SYMBOL = {'sigma': '\u03c3', 'pi': '\u03c0', 'delta': '\u03b4', 'phi': '\u03c6'}
+
+# Print the σ/π/δ/φ resolution of every bond population (bond_symmetry.py,
+# exact rotation into the diatomic frame). Set by -symmetry / -symmetry-shells.
+BOND_SYMMETRY = False
+BOND_SYMMETRY_SHELLS = False
+
+
+def _mbs_key(minimal_basis):
+    """Canonical key for a -minimal-basis value: 'sto3g', 'minao', 'anorccmb'."""
+    return str(minimal_basis).lower().replace('-', '').replace('_', '')
 
 
 # =============================================================================
@@ -99,7 +143,9 @@ def _basis_search_dirs(search_dir=None):
         dirs.append(search_dir)
     dirs.append(os.getcwd())
     try:
-        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        here = os.path.dirname(os.path.abspath(__file__))
+        dirs.append(here)
+        dirs.append(os.path.join(here, "basis_sets"))
     except NameError:  # __file__ undefined in some interactive contexts
         pass
     # de-duplicate while preserving order
@@ -158,7 +204,9 @@ def _extract_basis_dict(module, dict_name=None, hint=''):
                 f"specify it explicitly as 'module:DICTNAME'.")
 
     # Standard convention: the module declares its display name in BASIS_NAME.
-    name = getattr(module, 'BASIS_NAME', None) or dict_name or stem or None
+    name = (getattr(module, 'BASIS_NAME', None)
+            or getattr(basis_dict, 'name', None)
+            or dict_name or stem or None)
     return _NamedBasis(basis_dict, name=name)
 
 
@@ -235,6 +283,54 @@ def _basis_label(basis):
 
 
 
+def _compose_basis(basis, basis_light, atom_str, light_max_z=18, search_dir=None):
+    """
+    Per-element basis assignment: `basis` on atoms with Z > light_max_z,
+    `basis_light` on the rest (H-Ar by default). Returns (basis_obj, ecp, label).
+
+    Either name may be a standard PySCF basis, 'cbsb3'/'cbsb7', an ANO-RCC
+    truncation, a .py path or 'module:DICT'. ECPs are auto-detected per side
+    from the basis that actually sits on each atom, so 'def2-tzvp' on the
+    heavy atoms gets its ECP while '6-31G*' on H-Ar does not.
+    With basis_light None the molecule uses `basis` everywhere (old behavior).
+    """
+    from pyscf.data import elements
+    heavy = _resolve_basis(basis, search_dir=search_dir)
+    if basis_light is None:
+        ecp = _get_ecp_dict(heavy, atom_str) if isinstance(heavy, str) else None
+        return heavy, ecp, _basis_label(heavy)
+    light = _resolve_basis(basis_light, search_dir=search_dir)
+
+    def pick(resolved, elem):
+        if isinstance(resolved, str):
+            return resolved
+        if elem in resolved:
+            return resolved[elem]
+        raise KeyError(f"basis '{_basis_label(resolved)}' has no entry for {elem}")
+
+    basis_dict, symbols = {}, []
+    for line in atom_str.replace(';', '\n').split('\n'):
+        parts = line.split()
+        if not parts:
+            continue
+        sym = parts[0]
+        elem = ''.join(c for c in sym if c.isalpha())
+        if sym in basis_dict:
+            continue
+        z = elements.charge(elem)
+        basis_dict[sym] = pick(light if z <= light_max_z else heavy, elem)
+        symbols.append((sym, elem, z))
+
+    # ECP only for the heavy side, and only if that basis uses one
+    ecp = None
+    if isinstance(heavy, str):
+        heavy_atoms = '\n'.join(f"{s} 0 0 0" for s, e, z in symbols if z > light_max_z)
+        ecp = _get_ecp_dict(heavy, heavy_atoms) if heavy_atoms else None
+    label = (f"{_basis_label(heavy)} on Z>{light_max_z}, "
+             f"{_basis_label(light)} on Z<={light_max_z}")
+    return basis_dict, ecp, label
+
+
 # =============================================================================
 # Minimal Basis Construction
 # =============================================================================
@@ -273,10 +369,47 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     """
     from pyscf.data import elements
     
-    if minimal_basis.lower().replace('-', '') == 'minao':
+    key = _mbs_key(minimal_basis)
+    if key == 'minao':
         return gto.M(
             atom=mol.atom,
             basis={mol.atom_symbol(i): 'minao' for i in range(mol.natm)},
+            charge=mol.charge,
+            spin=mol.spin,
+            cart=False
+        )
+    if key == 'sto3gano':
+        # The sto-3g rule unchanged for H-Xe (STO-3G on H-Ne, STO-3G* on Na-Ar,
+        # STO-3G on K-Xe; every validated number and label unchanged) plus
+        # ANO-RCC-MB for atoms beyond Xe, which no STO-3G covers. The ANO tail (more extended
+        # valence functions, hence more ionic polar-bond partitioning) is
+        # then confined to bonds involving 6th/7th-row atoms.
+        anorcc = _resolve_basis('anorccmb')
+        basis_dict = {}
+        for i in range(mol.natm):
+            symbol = mol.atom_symbol(i)
+            elem = ''.join(c for c in symbol if c.isalpha())
+            if elements.charge(elem) > STO3G_MAX_Z:
+                basis_dict[symbol] = anorcc[elem]
+            elif elem in SECOND_ROW_ELEMENTS:
+                basis_dict[symbol] = 'STO-3G*'
+            else:
+                basis_dict[symbol] = 'STO-3G'
+        return gto.M(atom=mol.atom, basis=basis_dict, charge=mol.charge,
+                     spin=mol.spin, cart=False)
+    if key == 'anorccmb':
+        # ANO-RCC-MB: one contracted ANO per occupied atomic orbital plus the
+        # valence p on metals (Pt: 6s5p3d1f, Fe: 4s3p1d, C: 2s1p), i.e. the
+        # same shell structure STO-3G gives for H-Kr, extended all-electron
+        # and relativistically contracted through the whole periodic table.
+        # Shells are ordered generically by (n, l, m) downstream, so no
+        # element-specific Gaussian shell-number hacks are needed.
+        anorcc = _resolve_basis('anorccmb')
+        return gto.M(
+            atom=mol.atom,
+            basis={mol.atom_symbol(i): anorcc[''.join(
+                c for c in mol.atom_symbol(i) if c.isalpha())]
+                   for i in range(mol.natm)},
             charge=mol.charge,
             spin=mol.spin,
             cart=False
@@ -353,11 +486,118 @@ def _project_to_minimal_basis(mo_coeff, S_cross, S_min_inv):
     return C_proj @ M_invsqrt
 
 
+def _projection_completeness(mo_coeff, S_cross, S_min_inv, mo_energy=None):
+    """
+    How much of the occupied density the minimal basis can hold.
+
+    The eigenvalues of the metric M = C^T S_cross^T S_min^{-1} S_cross C are
+    the captured fractions of the occupied orbitals (1 = fully representable
+    in the minimal basis). Their sum is the captured electron count per spin;
+    the shortfall is density outside the span of the minimal basis. The
+    symmetric orthonormalization that follows rescales the projected orbitals
+    back to unit norm, so the reported Mulliken populations always sum to the
+    full electron count. This diagnostic is the only place the leak shows.
+
+    Returns
+    -------
+    dict with n_mo, captured (sum of eigenvalues), eigvals (ascending),
+    worst (smallest eigenvalue) and worst_mo (0-based index of the occupied
+    MO with the largest leak, from the eigenvector of the smallest eigenvalue).
+    """
+    C_proj = S_min_inv @ S_cross @ mo_coeff
+    S_min = np.linalg.inv(S_min_inv)
+    M = C_proj.T @ S_min @ C_proj
+    eigvals, eigvecs = np.linalg.eigh(M)
+    worst_mo = int(np.argmax(np.abs(eigvecs[:, 0])))
+    return {'n_mo': mo_coeff.shape[1], 'captured': float(eigvals.sum()),
+            'eigvals': eigvals, 'worst': float(eigvals[0]), 'worst_mo': worst_mo}
+
+
+def _print_projection_completeness(label, info, n_elec_spin):
+    leak = n_elec_spin - info['captured']
+    print(f" Projection completeness ({label}): {info['captured']:.5f} of "
+          f"{n_elec_spin:.0f} electrons captured, leak {leak:.5f} "
+          f"({100.0 * leak / n_elec_spin:.3f}%); least-captured MO #{info['worst_mo'] + 1} "
+          f"at {100.0 * info['worst']:.2f}%, {int((info['eigvals'] < 0.99).sum())} MOs below 99%")
+
+
 # =============================================================================
 # AO Reordering: PySCF → Gaussian Convention
 # =============================================================================
 
-def _get_gaussian_ao_order(mol_min):
+def _generic_ao_order(mol_min, label_style='gaussian'):
+    """
+    Order AOs by atom, then principal quantum number n, then l, then m in
+    Gaussian's spherical sequence (0, +1, -1, +2, -2, ...), with labels in
+    Gaussian's shell-counter convention (counter advances on every s, d, f
+    shell; a p shell shares its counter with the s of the same n).
+
+    This reproduces Gaussian's STO-3G order and labels for every case the
+    hand-written rules in _parse_ao_label cover (checked on H2O, CH2, CO, ScH)
+    and extends them to any minimal basis whose PySCF labels carry the
+    physical n, which a minimal basis with no shell gaps does (ANO-RCC-MB:
+    Pt 1s..6s, 2p..6p, 3d..5d, 4f). Used for ANO-RCC-MB; the STO-3G path
+    keeps the validated legacy routine.
+
+    Returns
+    -------
+    reorder : list of int
+    labels : list of tuple
+        (lbl, shell, ang, subtype, m_val) as _get_gaussian_ao_order returns.
+    """
+    ao_labels = mol_min.ao_labels(fmt=None)
+    lmap = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}
+    p_m = {'x': 1, 'y': -1, 'z': 0}
+    p_rank = {'x': 0, 'y': 1, 'z': 2}
+
+    def m_rank(m):
+        return 0 if m == 0 else 2 * abs(m) - (1 if m > 0 else 0)
+
+    parsed = []
+    for i, lbl in enumerate(ao_labels):
+        orb = lbl[2].lower().strip()
+        cart = (lbl[3] or '').lower().strip()
+        n = int(re.match(r'(\d+)', orb).group(1))
+        l = lmap[orb[len(str(n))]]
+        if l == 0:
+            m, sub, rank = 0, '', 0
+        elif l == 1:
+            m, sub, rank = p_m[cart], cart, p_rank[cart]
+        elif l == 2:
+            m, sub = _parse_spherical_d(cart)
+            rank = m_rank(m)
+        else:
+            m = int(cart.replace(' ', '')) if cart not in ('', '0') else 0
+            sub, rank = 'sph', m_rank(m)
+        parsed.append((lbl[0], n, l, rank, i, lbl, m, sub))
+    parsed.sort(key=lambda t: t[:4])
+
+    # Gaussian shell counter per atom: every distinct (n, l) block gets the
+    # next number, except a p block, which reuses the number of the s block
+    # with the same n (1S, 2S 2P, 3S 3P, 4D, 5S 5P, ...).
+    shell_of = {}
+    counter, prev_atom = 0, None
+    for atom, n, l, _rank, _i, _lbl, _m, _sub in parsed:
+        if atom != prev_atom:
+            counter, prev_atom = 0, atom
+        if (atom, n, l) in shell_of:
+            continue
+        if l == 1 and (atom, n, 0) in shell_of:
+            shell_of[(atom, n, l)] = shell_of[(atom, n, 0)]
+        else:
+            counter += 1
+            shell_of[(atom, n, l)] = counter
+
+    if label_style == 'physical':
+        shell_of = {k: k[1] for k in shell_of}
+
+    new_order = [t[4] for t in parsed]
+    new_labels = [(lbl, shell_of[(atom, n, l)], l, sub, m)
+                  for atom, n, l, _rank, _i, lbl, m, sub in parsed]
+    return new_order, new_labels
+
+
+def _get_gaussian_ao_order(mol_min, minimal_basis='sto-3g'):
     """
     Generate permutation to reorder AOs from PySCF to Gaussian convention.
     
@@ -381,6 +621,11 @@ def _get_gaussian_ao_order(mol_min):
         Reordered AO labels in Gaussian format
     """
     from pyscf.data import elements
+    
+    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano'):
+        style = LABEL_STYLE or ('physical' if _mbs_key(minimal_basis) == 'anorccmb'
+                                else 'gaussian')
+        return _generic_ao_order(mol_min, style)
     
     ao_labels = mol_min.ao_labels(fmt=None)
     
@@ -610,6 +855,11 @@ def _convert_label_to_gaussian(lbl_info):
         m_str = ' 0' if m_val == 0 else (f'+{m_val}' if m_val > 0 else str(m_val))
         return (atom_idx, elem, f'{shell}D{m_str}', '')
     
+    if ang >= 3:  # F, G, H: always spherical, Gaussian prints nF 0, nF+1, ...
+        letter = 'FGHI'[ang - 3]
+        m_str = ' 0' if m_val == 0 else (f'+{m_val}' if m_val > 0 else str(m_val))
+        return (atom_idx, elem, f'{shell}{letter}{m_str}', '')
+    
     return (atom_idx, elem, lbl[2].upper(), '')
 
 
@@ -740,13 +990,81 @@ def _print_mulliken_summary(charges, spins, mol):
     print(f" Sum of MBS Mulliken charges = {total_charge:10.5f} {total_spin:10.5f}")
 
 
+
+def _print_symmetry_section(results, mol_min, shells=False):
+    """Sigma/pi/delta/phi resolution of the MBS bond populations, printed in the
+    same formats as the matrices above. Called after the Mulliken summary."""
+    from bond_symmetry import class_matrices
+    reorder = results['ao_reorder']
+    inv = np.argsort(reorder)                      # Gaussian order -> PySCF order
+    S_min = mol_min.intor('int1e_ovlp')
+    ao_raw = results['ao_labels_raw']
+    ao_lab = results['ao_labels']
+
+    # Shell label as printed above (e.g. '9D' or '5D' depending on -label-style),
+    # keyed by (atom index, PySCF shell name such as '5d').
+    shell_name = {}
+    for raw, lab in zip(ao_raw, ao_lab):
+        pyscf_shell = raw[0][2].strip()
+        i = 0
+        while i < len(pyscf_shell) and pyscf_shell[i].isdigit():
+            i += 1
+        pyscf_shell = pyscf_shell[:i + 1]
+        printed = re.match(r'(\d+[A-Z])', lab[2]).group(1)
+        shell_name.setdefault((raw[0][0], pyscf_shell), printed)
+
+    print("MBS bond populations resolved by symmetry (\u03c3, \u03c0, \u03b4, \u03c6)")
+    print("=" * 60)
+
+    for dm_key, what, spin in (('dm_total', 'Condensed to atoms (all electrons)', False),
+                               ('dm_spin', 'Atomic-Atomic Spin Densities', True)):
+        dm = results[dm_key][np.ix_(inv, inv)]
+        if spin and np.abs(dm).max() < 1e-8:
+            print(" Spin density is zero; no spin-density bond populations.")
+            continue
+        cm = class_matrices(mol_min, dm, S_min)
+        # Put shells in the aufbau order used by the orbital matrices above
+        # (first appearance of each (atom, shell) in the reordered AO list).
+        printed_order = []
+        for raw in ao_raw:
+            name = raw[0][2].strip()
+            i = 0
+            while i < len(name) and name[i].isdigit():
+                i += 1
+            key = f"{mol_min.atom_symbol(raw[0][0])}{raw[0][0] + 1} {name[:i + 1]}"
+            if key not in printed_order:
+                printed_order.append(key)
+        perm = [cm['shell_labels'].index(k) for k in printed_order]
+        cm['shell_labels'] = [cm['shell_labels'][p] for p in perm]
+        for c in cm['classes']:
+            cm['shell'][c] = cm['shell'][c][np.ix_(perm, perm)]
+        labels = []
+        for lab in cm['shell_labels']:
+            sym_idx, sh = lab.split()
+            atom_idx = int(re.sub(r'[A-Za-z]', '', sym_idx)) - 1
+            labels.append((atom_idx, mol_min.atom_symbol(atom_idx),
+                           shell_name.get((atom_idx, sh), sh.upper()), ''))
+        for c in cm['classes']:
+            cname = _SYMMETRY_SYMBOL[c]
+            if np.abs(cm['atom'][c]).max() < 5e-7:
+                print(f"          MBS {cname} {what}: all entries below 1e-6")
+                continue
+            if shells:
+                _print_density_matrix(cm['shell'][c], labels,
+                                      f"{cname} bond populations condensed to shells"
+                                      + (" (spin density)" if spin else " (all electrons)"),
+                                      prefix="    ")
+            _print_atomic_matrix(cm['atom'][c], mol_min, f"{cname} {what}")
+        print()
+
+
 def _print_results(results, mol_min, n_doubly, n_singly):
     """Print complete analysis in Gaussian format."""
     ao_labels = results['ao_labels']
     
     print(f"ROHF orbital structure: {n_doubly} doubly occupied, {n_singly} singly occupied")
     print("=" * 60)
-    print("MinPop Analysis (ROHF)")
+    print("MinPop Analysis (RKS KS-DFT)")
     print("=" * 60)
     
     _print_density_matrix(results['dm_alpha'], ao_labels, "Alpha  MBS Density Matrix")
@@ -763,6 +1081,9 @@ def _print_results(results, mol_min, n_doubly, n_singly):
                            results['spin_populations'], mol_min)
     
     print("=" * 60)
+    if BOND_SYMMETRY:
+        _print_symmetry_section(results, mol_min, shells=BOND_SYMMETRY_SHELLS)
+        print("=" * 60)
 
 
 # =============================================================================
@@ -942,7 +1263,7 @@ def _get_ecp_dict(basis, atom_str):
 # =============================================================================
 
 _AZ_P_RE = re.compile(r'^(\d+)P([XYZ])$')
-_AZ_D_RE = re.compile(r'^(\d+)D([ +\-]\d)$')
+_AZ_D_RE = re.compile(r'^(\d+)([DFGH])([ +\-]\d)$')  # D and higher
 
 
 def _az_build_z_rotation(ao_labels, theta):
@@ -966,8 +1287,9 @@ def _az_build_z_rotation(ao_labels, theta):
             continue
         mD = _AZ_D_RE.match(ao)
         if mD:
-            shell = int(mD.group(1))
-            mv = int(mD.group(2).replace(' ', ''))
+            # key carries l so a 4D+1 and a 4F+1 never pair with each other
+            shell = (int(mD.group(1)), mD.group(2))
+            mv = int(mD.group(3).replace(' ', ''))
             if mv > 0:
                 plus[(atom, shell, mv)] = i
             elif mv < 0:
@@ -1096,6 +1418,34 @@ class MinPopSCFError(RuntimeError):
     """
 
 
+def aufbau_violation(mf):
+    """None if the converged closed-shell density fills the lowest orbitals of
+    its own Fock matrix; otherwise (holes, particles), 1-based orbital indices
+    in energy order.
+
+    Built from the density, not from the solver's orbital energies, so it
+    holds for any route to convergence. DIIS fills aufbau at every step and
+    passes by construction. A second-order solve keeps whatever occupation it
+    starts from and can converge with an occupied orbital above an empty one,
+    a state the internal stability test cannot see because it only rotates
+    orbitals at fixed occupation. At transition-state geometries where PBE in
+    a minimal basis has no closed-shell aufbau solution at all, every
+    converged integer-occupation solution fails this test.
+    """
+    import scipy.linalg as _sl
+    dm = mf.make_rdm1()
+    if getattr(dm, "ndim", 2) != 2:          # open-shell: not tested here
+        return None
+    S = mf.get_ovlp()
+    e, C = _sl.eigh(mf.get_fock(dm=dm), S)
+    nocc = mf.mol.nelectron // 2
+    w = np.einsum("pi,pq,qr,rs,si->i", C, S, dm, S, C) / 2
+    holes = [i + 1 for i in range(nocc) if w[i] < 0.5]
+    if not holes:
+        return None
+    return holes, [i + 1 for i in range(nocc, len(e)) if w[i] > 0.5]
+
+
 def _require_converged(mf, what):
     """Stop the run unless this SCF converged."""
     if not getattr(mf, "converged", False):
@@ -1105,7 +1455,7 @@ def _require_converged(mf, what):
             f"wavefunction are not reference quality. Try a different -guess.")
 
 
-def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
+def minpop_rks(mf, verbose=True, azimuthal_gauge=True,
                 minimal_basis='sto-3g'):
     """
     Perform MinPop population analysis on a converged ROHF calculation.
@@ -1134,14 +1484,16 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
     >>> from pyscf import gto, scf
     >>> mol = gto.M(atom='C 0 0 0; H 0 0 1.08', basis='6-31G*', spin=1)
     >>> mf = scf.ROHF(mol).run()
-    >>> results = minpop_rohf(mf)
+    >>> results = minpop_rks(mf)
     >>> print(f"Carbon charge: {results['mulliken_charges'][0]:.4f}")
     """
     mol = mf.mol
     mol_min = _build_minimal_basis_mol(mol, minimal_basis=minimal_basis)
     if verbose:
-        tag = ('MINAO' if minimal_basis.lower().replace('-', '') == 'minao'
-               else 'STO-3G (Gaussian MBS convention)')
+        tag = {'minao': 'MINAO',
+               'anorccmb': 'ANO-RCC-MB (all-electron, generic (n,l,m) order)',
+               'sto3gano': 'STO-3G for H-Xe, ANO-RCC-MB beyond Xe',
+               }.get(_mbs_key(minimal_basis), 'STO-3G (Gaussian MBS convention)')
         print(f" Minimal-basis projection: {tag}")
     
     # Compute overlap matrices
@@ -1157,6 +1509,9 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
     
     # Project occupied orbitals to minimal basis
     mo_min = _project_to_minimal_basis(mf.mo_coeff[:, :n_occ], S_cross, S_min_inv)
+    if verbose:
+        _ci = _projection_completeness(mf.mo_coeff[:, :n_occ], S_cross, S_min_inv)
+        _print_projection_completeness('occupied MOs, per spin-orbital', _ci, float(n_occ))
     
     # Separate alpha (all occupied) and beta (doubly occupied only)
     mo_alpha = mo_min
@@ -1174,8 +1529,9 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
     pop_total = _mulliken_pop_matrix(dm_total, S_min)
     pop_spin = _mulliken_pop_matrix(dm_spin, S_min)
     
+    
     # Reorder to Gaussian convention
-    reorder, ao_labels_raw = _get_gaussian_ao_order(mol_min)
+    reorder, ao_labels_raw = _get_gaussian_ao_order(mol_min, minimal_basis)
     
     dm_alpha = _reorder_matrix(dm_alpha, reorder)
     dm_beta = _reorder_matrix(dm_beta, reorder)
@@ -1237,6 +1593,8 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
         'mulliken_charges': mulliken_charges,
         'spin_populations': spin_populations,
         'ao_labels': ao_labels,
+        'ao_labels_raw': ao_labels_raw,
+        'ao_reorder': reorder,
     }
     
     if verbose:
@@ -1245,12 +1603,13 @@ def minpop_rohf(mf, verbose=True, azimuthal_gauge=True,
     return results
 
 
-def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
+def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                       ecp=None, verbose=True, basis_dir=None,
                       standard_orientation=True, azimuthal_gauge=True,
                       guess='minao', max_cycle=128, soscf=False,
-                      cartesian=False,
-                      minimal_basis='sto-3g'):
+                      cartesian=False, x2c=False, basis_light=None, light_max_z=18,
+                      minimal_basis='sto-3g',
+                     xc='pbe', grid_level=None):
     """
     Run ROHF calculation and MinPop analysis from an XYZ file.
     
@@ -1264,6 +1623,21 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         Spin multiplicity 2S+1 (default: 1)
     basis : str, optional
         Basis set (default: '6-31+G')
+    basis_light : str, optional
+        Basis for atoms with Z <= light_max_z (H-Ar by default); `basis`
+        then covers only the heavier atoms. Lets an expensive all-electron
+        basis such as ANO-RCC-VDZP sit on the metals only while H-Ar use
+        6-31G*, CBSB3, def2-SVP and so on. Default None: `basis` everywhere.
+    light_max_z : int, optional
+        Highest atomic number that takes basis_light (default 18, Ar).
+    x2c : bool, optional
+        Use the spin-free exact-two-component (sfX2C-1e) scalar-relativistic
+        one-electron Hamiltonian. Required for sensible all-electron results
+        on heavy atoms; ANO-RCC is contracted for a scalar-relativistic
+        (DKH2) Hamiltonian, so use it with every ANO-RCC run. The MinPop
+        projection is unchanged: X2C orbitals live in the same
+        non-relativistic AO basis, so S_cross and S_min are the usual
+        overlaps. Default False.
     cartesian : bool, optional
         Use Cartesian (6D/10F) angular functions for the COMPUTATIONAL basis
         instead of spherical (5D/7F). Default False (spherical), matching the
@@ -1275,6 +1649,13 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     minimal_basis : str, optional
         Minimal-basis projection target: 'sto-3g' (default, Gaussian's MBS
         convention) or 'minao'.
+    xc : str, optional
+        Exchange-correlation functional (PySCF/libxc name), default 'pbe'
+        (= Gaussian PBEPBE).
+    grid_level : int, optional
+        PySCF DFT grid level (0-9); None keeps PySCF's default (3). Gaussian's
+        default UltraFine grid is denser, so small SCF-energy differences
+        (~1e-5 Eh) between the codes are expected from the quadrature alone.
     ecp : str or dict, optional
         ECP specification. If None, auto-detects for def2 basis sets
         with heavy elements (Z > 36)
@@ -1284,11 +1665,11 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     Returns
     -------
     results : dict
-        MinPop analysis results (see minpop_rohf)
+        MinPop analysis results (see minpop_rks)
     
     Examples
     --------
-    >>> results = run_rohf_from_xyz("ch2.xyz", charge=0, multiplicity=3)
+    >>> results = run_rks_from_xyz("ch2.xyz", charge=0, multiplicity=3)
     >>> print(f"Carbon spin: {results['spin_populations'][0]:.4f}")
     """
     atom_str = _read_xyz(xyz_file)
@@ -1305,13 +1686,11 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
 
     # Resolve the computational basis: a standard name is passed through, while
     # 'cbsb3'/'cbsb7' (or a .py path / 'module:DICT') is loaded as a PySCF dict.
-    basis_obj = _resolve_basis(basis, search_dir=basis_dir)
-
-    # Auto-detect ECP for heavy elements (only meaningful for named basis sets;
-    # the custom CBSB3/CBSB7 dicts cover H-Ar and never need an ECP).
-    if ecp is None and isinstance(basis_obj, str):
-        ecp = _get_ecp_dict(basis_obj, atom_str)
-        if ecp and verbose:
+    basis_obj, auto_ecp, basis_name = _compose_basis(
+        basis, basis_light, atom_str, light_max_z=light_max_z, search_dir=basis_dir)
+    if ecp is None and auto_ecp:
+        ecp = auto_ecp
+        if verbose:
             print(f"Auto-detected ECP for heavy elements: {ecp}")
     
     mol = gto.M(
@@ -1326,7 +1705,7 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose:
         print(f"Molecule: {xyz_file}")
         print(f"Charge: {charge}, Multiplicity: {multiplicity}")
-        print(f"Basis: {_basis_label(basis_obj)} "
+        print(f"Basis: {basis_name} "
               f"({'6D/10F Cartesian' if cartesian else '5D/7F spherical'})")
         print(f"Atoms: {mol.natm}, Electrons: {mol.nelectron}")
         if orient_table:
@@ -1335,7 +1714,20 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
         print()
     
     # SCF with Gaussian-like defaults
-    mf = scf.ROHF(mol)
+    mf = dft.RKS(mol)
+    if x2c:
+        mf = mf.x2c()
+        if verbose:
+            print("Hamiltonian: spin-free X2C-1e (scalar relativistic)")
+    elif ecp is None and max(mol.atom_charge(i) for i in range(mol.natm)) > 36 \
+            and verbose:
+        print("WARNING: all-electron basis on an atom beyond Kr without -x2c; "
+              "non-relativistic orbitals for such atoms are not physical.")
+    mf.xc = xc
+    if grid_level is not None:
+        mf.grids.level = grid_level
+    if verbose:
+        print(f"KS-DFT: RKS xc={xc} grid level={mf.grids.level}")
     mf.max_cycle = max_cycle
     mf.conv_tol = 1e-8
     mf.conv_tol_grad = 1e-6
@@ -1354,12 +1746,36 @@ def run_rohf_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     if verbose and guess != 'minao':
         print(f"Initial guess: {guess}")
     mf.kernel(dm0=dm0)
+    if not mf.converged and not soscf:
+        # DIIS oscillates when the HOMO-LUMO gap is small, which a pure GGA
+        # gives at transition-state geometries. The second-order solver,
+        # seeded with the DIIS orbitals, reaches the same stationary point:
+        # the same rescue the IAO step of run_bond_analysis.py uses, so both
+        # PySCF codes converge the same cases and the campaign's energy
+        # cross-check still compares like with like.
+        if verbose:
+            print("SCF: DIIS did not converge; retrying with the "
+                  "second-order (Newton) solver")
+        _conv, _mx = mf.conv_tol, mf.max_cycle
+        mo, occ = mf.mo_coeff, mf.mo_occ
+        mf = mf.newton()
+        # its own budget, as in run_bond_analysis.py: a DIIS cap is not a
+        # sensible limit for the second-order stage
+        mf.conv_tol, mf.max_cycle = _conv, max(_mx, 100)
+        mf.kernel(mo, occ)
     _require_converged(mf, "SCF")
+    bad = aufbau_violation(mf)
+    if bad:
+        raise MinPopSCFError(
+            f"SCF converged to a non-aufbau solution (orbital(s) {bad[0]} "
+            f"empty, {bad[1]} occupied): no closed-shell ground state was "
+            f"found at this geometry (E = {mf.e_tot:.9f}). Populations from it "
+            f"would describe an excited configuration.")
     
     if verbose:
         print()
     
-    return minpop_rohf(mf, verbose=verbose, azimuthal_gauge=azimuthal_gauge,
+    return minpop_rks(mf, verbose=verbose, azimuthal_gauge=azimuthal_gauge,
                        minimal_basis=minimal_basis)
 
 
@@ -1480,15 +1896,15 @@ def _export_outputs(text, args):
 def main():
     """Command-line entry point."""
     parser = argparse.ArgumentParser(
-        description="MinPop analysis for ROHF wavefunctions",
+        description="MinPop analysis for RKS (KS-DFT) wavefunctions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python minpop_rohf.py -xyz ch2.xyz -charge 0 -mult 3
-  python minpop_rohf.py -xyz radical.xyz -mult 2 -basis cc-pVDZ
-  python minpop_rohf.py -xyz snh4.xyz -basis def2-TZVPP     # Auto-detects ECP
-  python minpop_rohf.py -xyz ch2.xyz -mult 3 -basis cbsb7   # Gaussian CBSB7 (H-Ar)
-  python minpop_rohf.py -xyz ch2.xyz -mult 3 -basis cbsb3 -basis-dir ./basis
+  python minpop_rks.py -xyz ch2.xyz -charge 0 -mult 3
+  python minpop_rks.py -xyz radical.xyz -mult 2 -basis cc-pVDZ
+  python minpop_rks.py -xyz snh4.xyz -basis def2-TZVPP     # Auto-detects ECP
+  python minpop_rks.py -xyz ch2.xyz -mult 3 -basis cbsb7   # Gaussian CBSB7 (H-Ar)
+  python minpop_rks.py -xyz ch2.xyz -mult 3 -basis cbsb3 -basis-dir ./basis
 
 Notes:
   Output matches Gaussian 16's Pop=(Full) IOp(6/27=122,6/12=3) format.
@@ -1497,6 +1913,9 @@ Notes:
   per-AO population output matches Gaussian; pass -no-std-orient to keep the
   input frame. Atomic charges and spins are rotation-invariant either way.
   ECP auto-detected for def2 basis sets with heavy elements (Z > 36).
+  ANO-RCC: -basis ano-rcc-vdzp (also -mb/-vtzp/-vqzp) with -minimal-basis
+  ano-rcc-mb and -x2c gives an all-electron relativistic MinPop for any
+  element H-Cm (needs anorcc_basis_pyscf.py next to this script).
   -basis accepts a standard name, 'cbsb3'/'cbsb7', a path to a *_basis_pyscf.py
   file, or 'module:DICTNAME'. Custom modules are found in -basis-dir, the current
   directory, or next to this script.
@@ -1526,9 +1945,44 @@ Notes:
                              "(default; matches Gen input, the 6-311G family "
                              "and cc-pVnZ)")
     parser.add_argument("-minimal-basis", "-mbs", dest="minimal_basis",
-                        choices=["sto-3g", "minao"], default="sto-3g",
+                        choices=list(MINIMAL_BASIS_CHOICES), default="sto-3g",
                         help="Minimal-basis projection target (default: "
-                             "sto-3g, Gaussian's MBS convention)")
+                             "sto-3g, Gaussian's MBS convention; "
+                             "ano-rcc-mb = all-electron relativistic ANO "
+                             "minimal basis, any element H-Cm; sto-3g-ano = "
+                             "STO-3G for H-Xe and ANO-RCC-MB beyond Xe)")
+    parser.add_argument("-label-style", dest="label_style",
+                        choices=["gaussian", "physical"], default=None,
+                        help="AO label numbering: gaussian = running shell "
+                             "counter as Gaussian prints it (Si 3d = 4D, Pt 5d "
+                             "= 9D), physical = principal quantum number (3D, "
+                             "5D). Default: gaussian for sto-3g and sto-3g-ano, "
+                             "physical for ano-rcc-mb. Labels only.")
+    parser.add_argument("-symmetry", "-sigma-pi", dest="symmetry", action="store_true",
+                        default=False,
+                        help="Resolve each bond population into σ/π/δ/φ "
+                             "(exact for any l and orientation); matrices condensed to atoms")
+    parser.add_argument("-symmetry-shells", "-sigma-pi-shells", dest="symmetry_shells",
+                        action="store_true", default=False,
+                        help="With -symmetry: also the matrices condensed to shells")
+    parser.add_argument("-basis-light", dest="basis_light", default=None,
+                        help="Basis for atoms up to -light-max-z (default Ar); -basis "
+                             "then applies to the heavier atoms only, e.g. "
+                             "-basis ano-rcc-vdzp -basis-light 6-31G*")
+    parser.add_argument("-light-max-z", dest="light_max_z", type=int, default=18,
+                        help="Highest Z that takes -basis-light (default 18)")
+    parser.add_argument("-x2c", dest="x2c", action="store_true",
+                        default=False,
+                        help="Scalar-relativistic sfX2C-1e Hamiltonian. Use "
+                             "with all-electron bases on heavy atoms "
+                             "(ANO-RCC-VDZP on Pt, etc.).")
+    parser.add_argument("-xc", default="pbe",
+                        help="Exchange-correlation functional (PySCF/libxc "
+                             "name; default pbe = Gaussian PBEPBE)")
+    parser.add_argument("-grid-level", dest="grid_level", type=int,
+                        default=None,
+                        help="PySCF DFT grid level 0-9 (default: PySCF's 3; "
+                             "raise to approach Gaussian's UltraFine grid)")
     parser.add_argument("-ecp", default=None,
                         help="ECP (auto-detected for def2 + heavy elements)")
     parser.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge",
@@ -1580,6 +2034,10 @@ Notes:
                         version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
+    global LABEL_STYLE, BOND_SYMMETRY, BOND_SYMMETRY_SHELLS
+    LABEL_STYLE = args.label_style
+    BOND_SYMMETRY = args.symmetry or args.symmetry_shells
+    BOND_SYMMETRY_SHELLS = args.symmetry_shells
 
     exporting = bool(args.json_path or args.csv_long)
     if exporting and args.quiet:
@@ -1598,7 +2056,7 @@ Notes:
                 print("Command line: python "
                       + " ".join(shlex.quote(a) for a in sys.argv))
 
-            run_rohf_from_xyz(
+            run_rks_from_xyz(
                 args.xyz_file,
                 charge=args.charge,
                 multiplicity=args.mult,
@@ -1612,7 +2070,12 @@ Notes:
             max_cycle=args.max_cycle,
             soscf=args.soscf,
             cartesian=args.cartesian,
-            minimal_basis=args.minimal_basis
+            x2c=args.x2c,
+            basis_light=args.basis_light,
+            light_max_z=args.light_max_z,
+            minimal_basis=args.minimal_basis,
+            xc=args.xc,
+            grid_level=args.grid_level
             )
         except MinPopSCFError as exc:
             failure = exc
