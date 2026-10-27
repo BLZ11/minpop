@@ -229,8 +229,11 @@ def minpop_gvbpp(g, minimal_basis='sto-3g', keep_tol=0.5, azimuthal_gauge=True,
     if verbose:
         tag = {'minao': 'MINAO',
                'anorccmb': 'ANO-RCC-MB (all-electron, generic (n,l,m) order)',
-               'sto3gano': 'STO-3G for H-Xe, ANO-RCC-MB beyond Xe',
+               'sto3gano': f'STO-3G on Z<={R.MBS_LIGHT_MAX_Z}, ANO-RCC-MB on Z>{R.MBS_LIGHT_MAX_Z}',
                }.get(R._mbs_key(minimal_basis), 'STO-3G (Gaussian MBS convention)')
+        if '+' in str(minimal_basis):
+            a, b = [s.strip() for s in minimal_basis.split('+')]
+            tag = f"{a.upper()} on Z<={R.MBS_LIGHT_MAX_Z}, {b.upper()} on Z>{R.MBS_LIGHT_MAX_Z}"
         print(f" Minimal-basis projection: {tag}")
 
     S_cross = intor_cross('int1e_ovlp', mol_min, mol)
@@ -482,7 +485,8 @@ def main():
     p.add_argument("-light-max-z", dest="light_max_z", type=int, default=18)
     p.add_argument("-basis-dir", dest="basis_dir", default=None)
     p.add_argument("-minimal-basis", "-mbs", dest="minimal_basis",
-                   choices=list(R.MINIMAL_BASIS_CHOICES), default="sto-3g")
+                   type=R._check_minimal_basis, default="sto-3g",
+                   help="sto-3g, minao, ano-rcc-mb, sto-3g-ano, or LIGHT+HEAVY")
     p.add_argument("-no-keep", dest="keep_tol", type=float, default=0.5,
                    help="Minimum independent fraction for a correlating NO to be "
                         "projected rather than merged into its bonding NO (default 0.5)")
@@ -515,6 +519,7 @@ def main():
     args = p.parse_args()
 
     R.LABEL_STYLE = args.label_style
+    R.MBS_LIGHT_MAX_Z = args.light_max_z
     R.BOND_SYMMETRY = args.symmetry or args.symmetry_shells
     R.BOND_SYMMETRY_SHELLS = args.symmetry_shells
     print("Command line: python " + " ".join(sys.argv))

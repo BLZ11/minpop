@@ -108,9 +108,24 @@ CUSTOM_BASIS_MODULES = {
 # Minimal-basis projection targets accepted by -minimal-basis.
 MINIMAL_BASIS_CHOICES = ('sto-3g', 'minao', 'ano-rcc-mb', 'sto-3g-ano')
 
-# Heaviest element with an STO-3G definition (Xe). Beyond it 'sto-3g-ano'
-# switches to ANO-RCC-MB, the only all-electron minimal basis available.
-STO3G_MAX_Z = 54
+# Per-element minimal basis: 'LIGHT+HEAVY' puts LIGHT on atoms with
+# Z <= MBS_LIGHT_MAX_Z and HEAVY on the rest, e.g. 'sto-3g+ano-rcc-mb' or
+# 'sto-3g+minao'. The cutoff follows -light-max-z (default 18, Ar).
+MBS_LIGHT_MAX_Z = 18
+
+
+def _check_minimal_basis(name):
+    parts = [s.strip() for s in str(name).split('+')]
+    for s in parts:
+        if _mbs_key(s) not in [_mbs_key(c) for c in MINIMAL_BASIS_CHOICES]:
+            raise ValueError(f"unknown minimal basis '{s}'; choose from "
+                             f"{MINIMAL_BASIS_CHOICES} or LIGHT+HEAVY")
+    if len(parts) > 2:
+        raise ValueError("minimal basis takes at most LIGHT+HEAVY")
+    return name
+
+# 'sto-3g-ano' = STO-3G (STO-3G* on Na-Ar) on Z <= MBS_LIGHT_MAX_Z (Ar) and
+# ANO-RCC-MB on every heavier atom, i.e. the alias of 'sto-3g+ano-rcc-mb'.
 
 # AO label numbering for the generic (ano-rcc-mb / sto-3g-ano) ordering path.
 # 'physical' (default): principal quantum number (Pt 5D, 6S, 4F).
@@ -370,6 +385,19 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     from pyscf.data import elements
     
     key = _mbs_key(minimal_basis)
+    if '+' in str(minimal_basis):
+        # LIGHT+HEAVY: build each side with this same function and merge.
+        light_name, heavy_name = [s.strip() for s in minimal_basis.split('+')]
+        light_mol = _build_minimal_basis_mol(mol, light_name)
+        heavy_mol = _build_minimal_basis_mol(mol, heavy_name)
+        basis_dict = {}
+        for i in range(mol.natm):
+            symbol = mol.atom_symbol(i)
+            z = elements.charge(''.join(c for c in symbol if c.isalpha()))
+            src = light_mol if z <= MBS_LIGHT_MAX_Z else heavy_mol
+            basis_dict[symbol] = src._basis[symbol]
+        return gto.M(atom=mol.atom, basis=basis_dict, charge=mol.charge,
+                     spin=mol.spin, cart=False)
     if key == 'minao':
         return gto.M(
             atom=mol.atom,
@@ -379,24 +407,9 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
             cart=False
         )
     if key == 'sto3gano':
-        # The sto-3g rule unchanged for H-Xe (STO-3G on H-Ne, STO-3G* on Na-Ar,
-        # STO-3G on K-Xe; every validated number and label unchanged) plus
-        # ANO-RCC-MB for atoms beyond Xe, which no STO-3G covers. The ANO tail (more extended
-        # valence functions, hence more ionic polar-bond partitioning) is
-        # then confined to bonds involving 6th/7th-row atoms.
-        anorcc = _resolve_basis('anorccmb')
-        basis_dict = {}
-        for i in range(mol.natm):
-            symbol = mol.atom_symbol(i)
-            elem = ''.join(c for c in symbol if c.isalpha())
-            if elements.charge(elem) > STO3G_MAX_Z:
-                basis_dict[symbol] = anorcc[elem]
-            elif elem in SECOND_ROW_ELEMENTS:
-                basis_dict[symbol] = 'STO-3G*'
-            else:
-                basis_dict[symbol] = 'STO-3G'
-        return gto.M(atom=mol.atom, basis=basis_dict, charge=mol.charge,
-                     spin=mol.spin, cart=False)
+        # STO-3G / STO-3G* on main-group atoms up to Ar, ANO-RCC-MB on every
+        # heavier atom (transition metals included). Same as 'sto-3g+ano-rcc-mb'.
+        return _build_minimal_basis_mol(mol, 'sto-3g+ano-rcc-mb')
     if key == 'anorccmb':
         # ANO-RCC-MB: one contracted ANO per occupied atomic orbital plus the
         # valence p on metals (Pt: 6s5p3d1f, Fe: 4s3p1d, C: 2s1p), i.e. the
@@ -622,9 +635,9 @@ def _get_gaussian_ao_order(mol_min, minimal_basis='sto-3g'):
     """
     from pyscf.data import elements
     
-    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano'):
-        style = LABEL_STYLE or ('physical' if _mbs_key(minimal_basis) == 'anorccmb'
-                                else 'gaussian')
+    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano') or '+' in str(minimal_basis):
+        style = LABEL_STYLE or ('gaussian' if _mbs_key(minimal_basis) == 'sto3gano'
+                                else 'physical')
         return _generic_ao_order(mol_min, style)
     
     ao_labels = mol_min.ao_labels(fmt=None)
@@ -1492,8 +1505,12 @@ def minpop_rks(mf, verbose=True, azimuthal_gauge=True,
     if verbose:
         tag = {'minao': 'MINAO',
                'anorccmb': 'ANO-RCC-MB (all-electron, generic (n,l,m) order)',
-               'sto3gano': 'STO-3G for H-Xe, ANO-RCC-MB beyond Xe',
+               'sto3gano': f'STO-3G on Z<={MBS_LIGHT_MAX_Z}, ANO-RCC-MB on Z>{MBS_LIGHT_MAX_Z}',
                }.get(_mbs_key(minimal_basis), 'STO-3G (Gaussian MBS convention)')
+        if '+' in str(minimal_basis):
+            light_name, heavy_name = [s.strip() for s in minimal_basis.split('+')]
+            tag = (f"{light_name.upper()} on Z<={MBS_LIGHT_MAX_Z}, "
+                   f"{heavy_name.upper()} on Z>{MBS_LIGHT_MAX_Z}")
         print(f" Minimal-basis projection: {tag}")
     
     # Compute overlap matrices
@@ -1945,12 +1962,14 @@ Notes:
                              "(default; matches Gen input, the 6-311G family "
                              "and cc-pVnZ)")
     parser.add_argument("-minimal-basis", "-mbs", dest="minimal_basis",
-                        choices=list(MINIMAL_BASIS_CHOICES), default="sto-3g",
+                        type=_check_minimal_basis, default="sto-3g",
                         help="Minimal-basis projection target (default: "
                              "sto-3g, Gaussian's MBS convention; "
                              "ano-rcc-mb = all-electron relativistic ANO "
                              "minimal basis, any element H-Cm; sto-3g-ano = "
-                             "STO-3G for H-Xe and ANO-RCC-MB beyond Xe)")
+                             "STO-3G on H-Ar and ANO-RCC-MB on heavier atoms; "
+                             "LIGHT+HEAVY, e.g. sto-3g+ano-rcc-mb or sto-3g+minao, "
+                             "puts LIGHT on Z<=-light-max-z and HEAVY on the rest)")
     parser.add_argument("-label-style", dest="label_style",
                         choices=["gaussian", "physical"], default=None,
                         help="AO label numbering: gaussian = running shell "
@@ -2034,7 +2053,8 @@ Notes:
                         version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
-    global LABEL_STYLE, BOND_SYMMETRY, BOND_SYMMETRY_SHELLS
+    global LABEL_STYLE, BOND_SYMMETRY, BOND_SYMMETRY_SHELLS, MBS_LIGHT_MAX_Z
+    MBS_LIGHT_MAX_Z = args.light_max_z
     LABEL_STYLE = args.label_style
     BOND_SYMMETRY = args.symmetry or args.symmetry_shells
     BOND_SYMMETRY_SHELLS = args.symmetry_shells
