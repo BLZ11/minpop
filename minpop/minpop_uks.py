@@ -369,6 +369,18 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
         mol_min._minpop_ecp_core = [int(mol.atom_nelec_core(i)) for i in range(mol.natm)]
     except Exception:
         mol_min._minpop_ecp_core = [0] * mol.natm
+    # An all-electron minimal basis on an ECP atom has core functions that the
+    # calculation has no electrons for; the nodeless pseudo-orbitals then spill
+    # into them (Rh/def2-ECP onto ANO-RCC-MB: ~1.3 e booked to 3s3p3d). Warn.
+    offsets = _label_offsets(mol_min)
+    bad = [mol_min.atom_symbol(i) for i, c in enumerate(mol_min._minpop_ecp_core)
+           if c and not any(offsets.get(i, {}).values())]
+    if bad:
+        print(f" WARNING: all-electron minimal basis on ECP atom(s) {bad}: the "
+              f"ECP removes core electrons the minimal basis still has functions "
+              f"for, so valence density spills into them. Use a valence-only "
+              f"minimal basis there (e.g. -minimal-basis sto-3g+minao) or an "
+              f"all-electron computational basis (e.g. -basis ano-rcc-vtzp -x2c).")
     return mol_min
 
 
