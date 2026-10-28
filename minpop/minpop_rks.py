@@ -1264,7 +1264,7 @@ def _get_ecp_dict(basis, atom_str):
             try:
                 z = elements.charge(elem)
                 if z > 36:
-                    ecp_dict[elem] = 'def2svp'
+                    ecp_dict[elem] = 'def2-ecp'   # one ECP for every def2 basis (Rh: ECP28MWB)
             except (KeyError, ValueError):
                 pass
     
