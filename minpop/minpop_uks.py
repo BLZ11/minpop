@@ -360,6 +360,19 @@ def _is_transition_metal(atomic_number):
 
 
 def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
+    """Minimal-basis molecule for the projection (see _build_minimal_basis_mol_impl).
+    Also records the ECP core electron count of each atom of `mol` on the
+    result (`_minpop_ecp_core`) so valence-only minimal shells can be labelled
+    with physical principal quantum numbers."""
+    mol_min = _build_minimal_basis_mol_impl(mol, minimal_basis)
+    try:
+        mol_min._minpop_ecp_core = [int(mol.atom_nelec_core(i)) for i in range(mol.natm)]
+    except Exception:
+        mol_min._minpop_ecp_core = [0] * mol.natm
+    return mol_min
+
+
+def _build_minimal_basis_mol_impl(mol, minimal_basis='sto-3g'):
     """
     Construct minimal basis molecule for the MinPop projection.
     
@@ -392,8 +405,8 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     if '+' in str(minimal_basis):
         # LIGHT+HEAVY: build each side with this same function and merge.
         light_name, heavy_name = [s.strip() for s in minimal_basis.split('+')]
-        light_mol = _build_minimal_basis_mol(mol, light_name)
-        heavy_mol = _build_minimal_basis_mol(mol, heavy_name)
+        light_mol = _build_minimal_basis_mol_impl(mol, light_name)
+        heavy_mol = _build_minimal_basis_mol_impl(mol, heavy_name)
         basis_dict = {}
         for i in range(mol.natm):
             symbol = mol.atom_symbol(i)
@@ -413,7 +426,7 @@ def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     if key == 'sto3gano':
         # STO-3G / STO-3G* on main-group atoms up to Ar, ANO-RCC-MB on every
         # heavier atom (transition metals included). Same as 'sto-3g+ano-rcc-mb'.
-        return _build_minimal_basis_mol(mol, 'sto-3g+ano-rcc-mb')
+        return _build_minimal_basis_mol_impl(mol, 'sto-3g+ano-rcc-mb')
     if key == 'anorccmb':
         # ANO-RCC-MB: one contracted ANO per occupied atomic orbital plus the
         # valence p on metals (Pt: 6s5p3d1f, Fe: 4s3p1d, C: 2s1p), i.e. the
@@ -745,6 +758,70 @@ def _annihilate_first_contaminant(mo_a, mo_b, S, n_a, n_b,
 # AO Reordering: PySCF → Gaussian Convention
 # =============================================================================
 
+# ECP core shells in the order standard cores are built (cumulative electrons:
+# 2, 4, 10, 12, 18, 28, 30, 36, 46, 60, 62, 68, 78, 92, 94, 100, 110).
+_CORE_SHELL_ORDER = [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 0), (4, 1),
+                     (4, 2), (4, 3), (5, 0), (5, 1), (5, 2), (5, 3), (6, 0), (6, 1), (6, 2)]
+
+
+def _ecp_core_shells(n_core):
+    """Number of core shells per l removed by an ECP with n_core electrons
+    (28 -> {0: 3, 1: 2, 2: 1}: 1s2s3s, 2p3p, 3d)."""
+    removed = {}
+    left = int(n_core)
+    for n, l in _CORE_SHELL_ORDER:
+        size = 2 * (2 * l + 1)
+        if left < size:
+            break
+        left -= size
+        removed[l] = removed.get(l, 0) + 1
+    return removed
+
+
+def _label_offsets(mol_min):
+    """Per-atom {l: offset} to add to PySCF's shell numbering so that a
+    valence-only minimal basis (MINAO on an ECP atom) is labelled with the
+    physical principal quantum numbers (Rh with a 28-electron core: 4S, 5S,
+    4P, 4D instead of 1S, 2S, 2P, 3D). The offset is the number of core shells
+    of that l removed by the ECP, capped by the number of shells the atom's
+    basis actually lacks relative to the all-electron minimal set, so an
+    all-electron minimal basis on an ECP atom is left unchanged."""
+    cores = getattr(mol_min, '_minpop_ecp_core', None)
+    if not cores or not any(cores):
+        return {}
+    try:
+        from anorcc_basis_pyscf import MB_COUNTS
+    except ImportError:
+        return {}
+    from pyscf.data import elements
+    ao = mol_min.ao_labels(fmt=None)
+    offsets = {}
+    for i in range(mol_min.natm):
+        if not cores[i]:
+            continue
+        elem = ''.join(c for c in mol_min.atom_symbol(i) if c.isalpha())
+        ae = MB_COUNTS.get(elem)
+        if ae is None:
+            continue
+        present = {}
+        for lab in ao:
+            if lab[0] != i:
+                continue
+            name = lab[2].strip()
+            k = 0
+            while k < len(name) and name[k].isdigit():
+                k += 1
+            present.setdefault(name[:k + 1], 0)
+        counts = {}
+        for sh in present:
+            l = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4}[sh[-1]]
+            counts[l] = counts.get(l, 0) + 1
+        core = _ecp_core_shells(cores[i])
+        offsets[i] = {l: max(0, min(core.get(l, 0), (ae[l] if l < len(ae) else 0) - counts.get(l, 0)))
+                      for l in counts}
+    return offsets
+
+
 def _generic_ao_order(mol_min, label_style='gaussian'):
     """
     Order AOs by atom, then principal quantum number n, then l, then m in
@@ -766,6 +843,7 @@ def _generic_ao_order(mol_min, label_style='gaussian'):
         (lbl, shell, ang, subtype, m_val) as _get_gaussian_ao_order returns.
     """
     ao_labels = mol_min.ao_labels(fmt=None)
+    offsets = _label_offsets(mol_min)
     lmap = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}
     p_m = {'x': 1, 'y': -1, 'z': 0}
     p_rank = {'x': 0, 'y': 1, 'z': 2}
@@ -779,6 +857,7 @@ def _generic_ao_order(mol_min, label_style='gaussian'):
         cart = (lbl[3] or '').lower().strip()
         n = int(re.match(r'(\d+)', orb).group(1))
         l = lmap[orb[len(str(n))]]
+        n += offsets.get(lbl[0], {}).get(l, 0)
         if l == 0:
             m, sub, rank = 0, '', 0
         elif l == 1:
