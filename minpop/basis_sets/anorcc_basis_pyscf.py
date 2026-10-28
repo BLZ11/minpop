@@ -16,7 +16,8 @@ ANO-RCC is contracted for the DKH2 Hamiltonian, so pair it with a scalar
 relativistic SCF (the MinPop scripts' -x2c flag) for heavy atoms.
 
 Exposed dicts (all lazily built, element symbol -> PySCF shell list):
-    ANO_RCC_MB, ANO_RCC_VDZP, ANO_RCC_VTZP, ANO_RCC_VQZP
+    ANO_RCC_MB, ANO_RCC_MB_OCC (no empty valence p beyond Ar), ANO_RCC_VDZP,
+    ANO_RCC_VTZP, ANO_RCC_VQZP
 
 Loadable by the MinPop scripts as -basis ano-rcc-vdzp etc., or directly:
     from anorcc_basis_pyscf import ANO_RCC_VDZP
@@ -30,8 +31,8 @@ import numpy as np
 from pyscf import gto
 from pyscf.data import elements as _el
 
-__all__ = ["ANO_RCC_MB", "ANO_RCC_VDZP", "ANO_RCC_VTZP", "ANO_RCC_VQZP",
-           "truncate_ano", "ano_rcc"]
+__all__ = ["ANO_RCC_MB", "ANO_RCC_MB_OCC", "ANO_RCC_VDZP", "ANO_RCC_VTZP", "ANO_RCC_VQZP",
+           "truncate_ano", "ano_rcc", "MB_COUNTS", "MB_OCC_COUNTS"]
 
 # Number of contracted functions kept per angular momentum (s, p, d, f, g, h),
 # element by element, for each named truncation.
@@ -214,12 +215,38 @@ class _LazyBasis(dict):
         return copy.deepcopy(self)
 
 
+# ANO-RCC-MB with only the occupied valence shells on atoms beyond Ar: the
+# empty outermost p (4p on Ca and Sc-Zn, 5p on Rb-Cd, 6p on Cs-Hg and the
+# lanthanides, 7p on the actinides) is dropped; p-block atoms (Ga-Kr, In-Xe,
+# Tl-Rn, Nh-Og) keep it since it is occupied. This is the shell structure of
+# PySCF's MINAO wherever MINAO is defined (Ca-Kr all-electron; Y-Cd, In-Xe,
+# Hf-Hg, Tl-Rn as valence sets on top of the 28- or 60-electron core),
+# extended by the same rule to the elements MINAO lacks. H-Ar are unchanged.
+# Use it when metal charges should not absorb ligand density through an
+# empty, diffuse p function (Rh(CO)3: 5p takes 0.75 e with ANO-RCC-MB).
+_P_BLOCK = set(range(31, 37)) | set(range(49, 55)) | set(range(81, 87)) | set(range(113, 119))
+
+
+def _occ_counts(counts_table):
+    out = {}
+    for sym, counts in counts_table.items():
+        z = _el.charge(sym)
+        c = list(counts)
+        if z > 18 and z not in _P_BLOCK and len(c) > 1 and c[1] > 0:
+            c[1] -= 1
+        out[sym] = tuple(c)
+    return out
+
+
+MB_OCC_COUNTS = _occ_counts(MB_COUNTS)
+
 ANO_RCC_MB = _LazyBasis('ANO-RCC-MB', MB_COUNTS)
+ANO_RCC_MB_OCC = _LazyBasis('ANO-RCC-MB-OCC', MB_OCC_COUNTS)
 ANO_RCC_VDZP = _LazyBasis('ANO-RCC-VDZP', VDZP_COUNTS)
 ANO_RCC_VTZP = _LazyBasis('ANO-RCC-VTZP', VTZP_COUNTS)
 ANO_RCC_VQZP = _LazyBasis('ANO-RCC-VQZP', VQZP_COUNTS)
 
-_BY_NAME = {'mb': ANO_RCC_MB, 'vdzp': ANO_RCC_VDZP,
+_BY_NAME = {'mb': ANO_RCC_MB, 'mb-occ': ANO_RCC_MB_OCC, 'vdzp': ANO_RCC_VDZP,
             'vtzp': ANO_RCC_VTZP, 'vqzp': ANO_RCC_VQZP}
 
 

@@ -96,3 +96,11 @@ def test_sto3g_ano_beyond_xe():
               "-basis-light", "6-31G*", "-x2c", "-minimal-basis", "sto-3g-ano")
     assert "STO-3G on Z<=18, ANO-RCC-MB on Z>18" in out
     assert abs(charges(out).sum(0)[0]) < 1e-5
+
+
+def test_ano_rcc_mb_occ_shells():
+    sys.path.insert(0, os.path.join(PKG, "basis_sets"))
+    from anorcc_basis_pyscf import MB_COUNTS, MB_OCC_COUNTS
+    assert MB_OCC_COUNTS["Rh"] == (5, 3, 2) and MB_COUNTS["Rh"] == (5, 4, 2)
+    assert MB_OCC_COUNTS["Fe"] == (4, 2, 1) and MB_OCC_COUNTS["Ga"] == (4, 3, 1)
+    assert MB_OCC_COUNTS["Pt"] == (6, 4, 3, 1) and MB_OCC_COUNTS["C"] == (2, 1)

@@ -229,7 +229,9 @@ def minpop_gvbpp(g, minimal_basis='sto-3g', keep_tol=0.5, azimuthal_gauge=True,
     if verbose:
         tag = {'minao': 'MINAO',
                'anorccmb': 'ANO-RCC-MB (all-electron, generic (n,l,m) order)',
+               'anorccmbocc': 'ANO-RCC-MB-OCC (all-electron, no empty valence p beyond Ar)',
                'sto3gano': f'STO-3G on Z<={R.MBS_LIGHT_MAX_Z}, ANO-RCC-MB on Z>{R.MBS_LIGHT_MAX_Z}',
+               'sto3ganoocc': f'STO-3G on Z<={R.MBS_LIGHT_MAX_Z}, ANO-RCC-MB-OCC on Z>{R.MBS_LIGHT_MAX_Z}',
                }.get(R._mbs_key(minimal_basis), 'STO-3G (Gaussian MBS convention)')
         if '+' in str(minimal_basis):
             a, b = [s.strip() for s in minimal_basis.split('+')]
@@ -426,6 +428,8 @@ def run_gvbpp_from_xyz(xyz_file, n_pairs, charge=0, multiplicity=1, basis='6-31+
         print()
 
     mf = scf.ROHF(mol) if mol.spin else scf.RHF(mol)
+    if x2c_atomic:
+        x2c = True            # -x2c-atomic is a form of -x2c
     if x2c:
         mf = mf.x2c()
         if x2c_atomic:
@@ -491,7 +495,7 @@ def main():
     p.add_argument("-basis-dir", dest="basis_dir", default=None)
     p.add_argument("-minimal-basis", "-mbs", dest="minimal_basis",
                    type=R._check_minimal_basis, default="sto-3g",
-                   help="sto-3g, minao, ano-rcc-mb, sto-3g-ano, or LIGHT+HEAVY")
+                   help="sto-3g, minao, ano-rcc-mb, ano-rcc-mb-occ, sto-3g-ano, or LIGHT+HEAVY")
     p.add_argument("-no-keep", dest="keep_tol", type=float, default=0.5,
                    help="Minimum independent fraction for a correlating NO to be "
                         "projected rather than merged into its bonding NO (default 0.5)")
@@ -503,7 +507,7 @@ def main():
                    default=False, help="With -symmetry: also condensed to shells")
     p.add_argument("-x2c", dest="x2c", action="store_true", default=False)
     p.add_argument("-x2c-atomic", dest="x2c_atomic", action="store_true", default=False,
-                   help="With -x2c: atom-by-atom (DLU) decoupling, linear-scaling")
+                   help="X2C with atom-by-atom (DLU) decoupling, linear-scaling (implies -x2c)")
     p.add_argument("-ecp", default=None)
     p.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge", action="store_false",
                    default=True)

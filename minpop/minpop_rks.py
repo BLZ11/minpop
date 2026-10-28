@@ -100,13 +100,15 @@ CUSTOM_BASIS_MODULES = {
     # contraction by anorcc_basis_pyscf.py (all-electron, DKH2-contracted;
     # pair with -x2c for heavy atoms).
     'anorccmb':   ('anorcc_basis_pyscf', 'ANO_RCC_MB'),
+    'anorccmbocc': ('anorcc_basis_pyscf', 'ANO_RCC_MB_OCC'),
     'anorccvdzp': ('anorcc_basis_pyscf', 'ANO_RCC_VDZP'),
     'anorccvtzp': ('anorcc_basis_pyscf', 'ANO_RCC_VTZP'),
     'anorccvqzp': ('anorcc_basis_pyscf', 'ANO_RCC_VQZP'),
 }
 
 # Minimal-basis projection targets accepted by -minimal-basis.
-MINIMAL_BASIS_CHOICES = ('sto-3g', 'minao', 'ano-rcc-mb', 'sto-3g-ano')
+MINIMAL_BASIS_CHOICES = ('sto-3g', 'minao', 'ano-rcc-mb', 'ano-rcc-mb-occ', 'sto-3g-ano',
+                         'sto-3g-ano-occ')
 
 # Per-element minimal basis: 'LIGHT+HEAVY' puts LIGHT on atoms with
 # Z <= MBS_LIGHT_MAX_Z and HEAVY on the rest, e.g. 'sto-3g+ano-rcc-mb' or
@@ -459,14 +461,16 @@ def _build_minimal_basis_mol_impl(mol, minimal_basis='sto-3g'):
         # STO-3G / STO-3G* on main-group atoms up to Ar, ANO-RCC-MB on every
         # heavier atom (transition metals included). Same as 'sto-3g+ano-rcc-mb'.
         return _build_minimal_basis_mol_impl(mol, 'sto-3g+ano-rcc-mb')
-    if key == 'anorccmb':
+    if key == 'sto3ganoocc':
+        return _build_minimal_basis_mol_impl(mol, 'sto-3g+ano-rcc-mb-occ')
+    if key in ('anorccmb', 'anorccmbocc'):
         # ANO-RCC-MB: one contracted ANO per occupied atomic orbital plus the
         # valence p on metals (Pt: 6s5p3d1f, Fe: 4s3p1d, C: 2s1p), i.e. the
         # same shell structure STO-3G gives for H-Kr, extended all-electron
         # and relativistically contracted through the whole periodic table.
         # Shells are ordered generically by (n, l, m) downstream, so no
         # element-specific Gaussian shell-number hacks are needed.
-        anorcc = _resolve_basis('anorccmb')
+        anorcc = _resolve_basis(key)
         return gto.M(
             atom=mol.atom,
             basis={mol.atom_symbol(i): anorcc[''.join(
@@ -750,7 +754,8 @@ def _get_gaussian_ao_order(mol_min, minimal_basis='sto-3g'):
     """
     from pyscf.data import elements
     
-    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano', 'minao') or '+' in str(minimal_basis):
+    if _mbs_key(minimal_basis) in ('anorccmb', 'anorccmbocc', 'sto3gano', 'sto3ganoocc', 'minao') \
+            or '+' in str(minimal_basis):
         # Default label style: Gaussian's counter where the output is meant to
         # match Gaussian (sto-3g-ano, minao on light atoms); physical quantum
         # numbers for ANO-RCC-MB and whenever an atom carries a valence-only
@@ -759,7 +764,7 @@ def _get_gaussian_ao_order(mol_min, minimal_basis='sto-3g'):
         if style is None:
             if _label_offsets(mol_min):
                 style = 'physical'
-            elif _mbs_key(minimal_basis) in ('sto3gano', 'minao'):
+            elif _mbs_key(minimal_basis) in ('sto3gano', 'sto3ganoocc', 'minao'):
                 style = 'gaussian'
             else:
                 style = 'physical'
@@ -1630,7 +1635,9 @@ def minpop_rks(mf, verbose=True, azimuthal_gauge=True,
     if verbose:
         tag = {'minao': 'MINAO',
                'anorccmb': 'ANO-RCC-MB (all-electron, generic (n,l,m) order)',
+               'anorccmbocc': 'ANO-RCC-MB-OCC (all-electron, no empty valence p beyond Ar)',
                'sto3gano': f'STO-3G on Z<={MBS_LIGHT_MAX_Z}, ANO-RCC-MB on Z>{MBS_LIGHT_MAX_Z}',
+               'sto3ganoocc': f'STO-3G on Z<={MBS_LIGHT_MAX_Z}, ANO-RCC-MB-OCC on Z>{MBS_LIGHT_MAX_Z}',
                }.get(_mbs_key(minimal_basis), 'STO-3G (Gaussian MBS convention)')
         if '+' in str(minimal_basis):
             light_name, heavy_name = [s.strip() for s in minimal_basis.split('+')]
@@ -1858,6 +1865,8 @@ def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     
     # SCF with Gaussian-like defaults
     mf = dft.RKS(mol)
+    if x2c_atomic:
+        x2c = True            # -x2c-atomic is a form of -x2c
     if x2c:
         mf = mf.x2c()
         if x2c_atomic:
@@ -2097,7 +2106,9 @@ Notes:
                         help="Minimal-basis projection target (default: "
                              "sto-3g, Gaussian's MBS convention; "
                              "ano-rcc-mb = all-electron relativistic ANO "
-                             "minimal basis, any element H-Cm; sto-3g-ano = "
+                             "minimal basis, any element H-Cm; ano-rcc-mb-occ = "
+                             "the same without the empty valence p on atoms beyond "
+                             "Ar (MINAO shell structure); sto-3g-ano = "
                              "STO-3G on H-Ar and ANO-RCC-MB on heavier atoms; "
                              "LIGHT+HEAVY, e.g. sto-3g+ano-rcc-mb or sto-3g+minao, "
                              "puts LIGHT on Z<=-light-max-z and HEAVY on the rest)")
@@ -2123,7 +2134,7 @@ Notes:
                         help="Highest Z that takes -basis-light (default 18)")
     parser.add_argument("-x2c-atomic", dest="x2c_atomic", action="store_true",
                         default=False,
-                        help="With -x2c: build the X2C decoupling atom by atom "
+                        help="X2C with the decoupling built atom by atom "
                              "(DLU approximation). Same physics for population "
                              "analysis, cost linear in the number of atoms.")
     parser.add_argument("-x2c", dest="x2c", action="store_true",

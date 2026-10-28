@@ -139,8 +139,8 @@ MBS bond populations resolved by symmetry (σ, π, δ, φ)    [with -symmetry]
 | `-xyz FILE -charge N -mult M` | geometry (Å), charge, multiplicity 2S+1 |
 | `-basis NAME` | computational basis: any PySCF name, `cbsb3`, `cbsb7`, `ano-rcc-vdzp` / `-vtzp` / `-vqzp` / `-mb`, a `.py` basis file, or `module:DICT` |
 | `-basis-light NAME`, `-light-max-z Z` | basis for atoms with Z ≤ 18 (Ar); `-basis` then covers only the heavier atoms. ECPs are detected per side |
-| `-minimal-basis NAME` | projection target: `sto-3g` (default), `ano-rcc-mb`, `sto-3g-ano`, `minao`, or `LIGHT+HEAVY` such as `sto-3g+ano-rcc-mb` or `sto-3g+minao` (LIGHT on Z ≤ `-light-max-z`, HEAVY on the rest); see §7 |
-| `-x2c`, `-x2c-atomic` | scalar-relativistic X2C-1e Hamiltonian for the whole molecule; use with ANO-RCC and with any all-electron basis beyond Kr. `-x2c-atomic` builds the decoupling atom by atom (DLU), same populations, cost linear in the number of atoms |
+| `-minimal-basis NAME` | projection target: `sto-3g` (default), `ano-rcc-mb`, `ano-rcc-mb-occ`, `sto-3g-ano`, `sto-3g-ano-occ`, `minao`, or `LIGHT+HEAVY` such as `sto-3g+ano-rcc-mb` or `sto-3g+minao` (LIGHT on Z ≤ `-light-max-z`, HEAVY on the rest); see §7 |
+| `-x2c`, `-x2c-atomic` | scalar-relativistic X2C-1e Hamiltonian for the whole molecule; use with ANO-RCC and with any all-electron basis beyond Kr. `-x2c-atomic` (implies `-x2c`) builds the decoupling atom by atom (DLU), same populations, cost linear in the number of atoms |
 | `-symmetry`, `-symmetry-shells` | σ/π/δ/φ matrices condensed to atoms, and additionally to shells (`-sigma-pi` is an accepted alias) |
 | `-label-style {gaussian, physical}` | orbital labels as Gaussian prints them, a running shell counter (Si 3d = 4D, Pt 5d = 9D), or by principal quantum number (3D, 5D). Default: Gaussian's for `sto-3g` and `sto-3g-ano`, physical for `ano-rcc-mb`. Labels only |
 | `-soscf`, `-guess`, `-stable`, `-guessmix`, `-max-cycle` | SCF convergence: Newton solver, initial guess, stability analysis, broken-symmetry mixing |
@@ -179,8 +179,9 @@ The minimal basis defines the partitioning. Any choice is a convention; hold it 
 |---|---|---|
 | `sto-3g` (default) | H to Xe | Gaussian's MBS convention: STO-3G on H to Ne, STO-3G* on Na to Ar (adds a 3d shell, five spherical functions), STO-3G on K to Xe. Three Gaussians fit to Slater orbitals with Slater's-rules exponents, slightly contracted relative to free atoms. The validated path |
 | `ano-rcc-mb` | H to Cm | One contracted atomic natural orbital per occupied atomic orbital, plus the valence p on metals (C: 2s1p, Fe: 4s3p1d, Pt: 6s5p3d1f). All-electron, contracted for a scalar-relativistic Hamiltonian, so it covers the whole periodic table and needs no ECP. The only all-electron minimal basis beyond Xe |
+| `ano-rcc-mb-occ` | H to Cm | ANO-RCC-MB without the empty outermost p on s-, d- and f-block atoms beyond Ar (4p on Sc–Zn, 5p on Y–Cd, 6p on Hf–Hg and the lanthanides); p-block atoms and H–Ar unchanged. This is MINAO's valence shell structure wherever MINAO is defined, extended by the same rule to the elements it lacks. Use it when a metal charge should not absorb ligand density through a diffuse empty p: Rh(CO)₃ puts 0.75 e into Rh 5p with `ano-rcc-mb` and reads Rh +0.04 instead of +0.7 |
 | `sto-3g-ano` | H to Cm | The `sto-3g` rule for main-group atoms up to Ar (STO-3G on H to Ne, STO-3G* on Na to Ar) and ANO-RCC-MB on every heavier atom, transition metals included. Same labels and numbers as `sto-3g` for molecules of H to Ar; the default choice for metal complexes with main-group ligands. Alias of `sto-3g+ano-rcc-mb` |
-| `minao` | H to Kr (valence-only beyond) | PySCF's IAO reference basis. Behaves like ANO-RCC-MB on light atoms; cannot span an all-electron heavy-atom density |
+| `minao` | H to Kr all-electron; Y–Cd, In–Xe, Hf–Hg, Tl–Rn as valence-only sets | PySCF's IAO reference basis. Kept for completeness and for ECP calculations on 4d/5d metals, where it is the only valence-matched choice; not recommended as a general minimal basis (see below) |
 
 How the two main choices differ, on the same HF/ANO-RCC-VDZP wavefunctions:
 
@@ -198,6 +199,20 @@ The general form is `-minimal-basis LIGHT+HEAVY`: `sto-3g+ano-rcc-mb` is what `s
 Rule of thumb: `sto-3g` when results must be compared with existing STO-3G/Gaussian numbers; `sto-3g-ano` for metal complexes, where the ligands keep the STO-3G convention and the metal gets the all-electron ANO function set (identical to `sto-3g` on SiH₄ and HCl); `ano-rcc-mb` when every bond in a study, light or heavy, should be partitioned by one convention. For a homonuclear or heavy–heavy bond the two agree.
 
 The minimal basis must match the core treatment of the calculation. With an ECP on the metal (def2 family), use MINAO there (`sto-3g+minao`): it is valence-only and fits the 28- or 60-electron core exactly. An all-electron minimal basis on an ECP atom (ANO-RCC-MB, or STO-3G as Gaussian does) carries core functions the calculation has no electrons for, and the nodeless pseudo-orbitals spill into them; Rh/def2-ECP projected onto ANO-RCC-MB puts about 1.3 e into 3s3p3d and the charges become meaningless. The driver prints a warning in that case. Conversely, ANO-RCC-MB belongs with an all-electron calculation (`-basis ano-rcc-vtzp -x2c`), which is where `-x2c` is also required.
+
+**How the minimal bases differ on H–Ar.** They agree on H, He and B–Ne (1s; 2s 1p), and nowhere else:
+
+| Elements | STO-3G / STO-3G* | MINAO | ANO-RCC-MB |
+|---|---|---|---|
+| Li, Be | 2s 1p | 2s | 2s 1p |
+| Na, Mg | 3s 2p 1d | 3s 1p | 3s 2p |
+| Al–Ar | 3s 2p 1d | 3s 2p | 3s 2p |
+
+STO-3G* carries a 3d polarization shell on the second row (14 functions on Si against 9 or 6), which neither of the others has, so second-row populations are not interchangeable across the three. MINAO drops the empty valence p on Li, Be, Na, Mg as it does on the metals; `ano-rcc-mb-occ` leaves H–Ar as in ANO-RCC-MB.
+
+**On MINAO.** It is available because PySCF ships it and because an ECP calculation on a 4d or 5d metal has no other valence-matched minimal basis. It is not a good general choice: its light-atom functions come from a different source (cc-pVTZ atomic orbitals) than its heavy-atom functions, it has no entries for K, Rb, Sr, Cs, Ba, the lanthanides or actinides, beyond Kr it is valence-only and cannot be used with an all-electron calculation, and it leaves out the 3d of STO-3G* on Na–Ar. For light atoms it partitions like ANO-RCC-MB (H₂O, CO, LiF within 0.01 of it). Prefer `sto-3g`, `sto-3g-ano(-occ)` or `ano-rcc-mb(-occ)` unless the calculation uses an ECP, and then use `sto-3g+minao` and read the completeness line.
+
+**ECPs and ANO-RCC-MB.** Removing the ECP's core shells from ANO-RCC-MB (keeping 4s 5s 4p 4d on Rh with the 28-electron def2-ECP) is possible but projects poorly: the all-electron ANO valence functions have radial nodes inside the core where the pseudo-orbitals are nodeless, and on RhH 7.5 % of the valence density leaks, against 1.6 % with MINAO. MinPop therefore does not offer it. With an ECP use MINAO on that atom; with ANO-RCC-MB use an all-electron calculation.
 
 The ANO-RCC family (`minpop/basis_sets/anorcc_basis_pyscf.py`) is sliced from PySCF's built-in ANO-RCC general contraction with per-element column counts; the result equals Basis Set Exchange's ano-rcc-mb/vdzp/vtzp/vqzp to 10⁻¹². No extra package is needed at run time.
 

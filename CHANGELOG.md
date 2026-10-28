@@ -7,6 +7,7 @@ Added
 - `minpop/basis_sets/anorcc_basis_pyscf.py`: ANO-RCC-MB/VDZP/VTZP/VQZP sliced from PySCF's ANO-RCC; verified against Basis Set Exchange.
 - `-x2c` scalar-relativistic Hamiltonian in every driver; `-x2c-atomic` for atom-by-atom (DLU) decoupling.
 - `-basis-light` / `-light-max-z`: per-element computational basis split with per-side ECP detection.
+- `ano-rcc-mb-occ` / `sto-3g-ano-occ`: ANO-RCC-MB without the empty outermost p on non-p-block atoms beyond Ar (MINAO valence structure).
 - `-minimal-basis LIGHT+HEAVY` (e.g. `sto-3g+ano-rcc-mb`, `sto-3g+minao`): per-element minimal basis with the same cutoff.
 - `-symmetry` / `-symmetry-shells` (alias `-sigma-pi`): exact σ/π/δ/φ resolution of bond populations (`minpop/bond_symmetry.py`), printed as MBS matrices condensed to atoms and shells for the total and spin density.
 - `minpop_gvbpp.py`: MinPop on GVB-PP natural orbitals (keithgroup/gvbpp) with occupation-weighted projection, representability rule for correlating NOs, valence-restricted pair search, multi-start with seed control, per-pair bond table.
