@@ -16,16 +16,22 @@
 # shows how well they hold the 17 valence electrons).
 set -u
 export PYTHONIOENCODING=utf-8
-XYZ=xyz/rhco3.xyz
-COMMON="-xyz $XYZ -mult 3 -xc pbe -stable -symmetry-shells"
+XYZ=rhco3.xyz
+COMMON="-xyz $XYZ -mult 2 -xc pbe -stable -symmetry-shells"
 
-minpop-uks $COMMON -basis ano-rcc-vtzp                          -x2c -minimal-basis ano-rcc-mb         > rhco3_case1.out 2>&1
-minpop-uks $COMMON -basis ano-rcc-vtzp                          -x2c -minimal-basis sto-3g-ano         > rhco3_case2.out 2>&1
-minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c -minimal-basis sto-3g-ano         > rhco3_case3.out 2>&1
-minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light "6-31G*"    -x2c -minimal-basis sto-3g-ano         > rhco3_case4.out 2>&1
-minpop-uks $COMMON -basis def2-tzvpp                                 -minimal-basis sto-3g+minao        > rhco3_case5.out 2>&1
+minpop-uks $COMMON -basis def2-tzvpp                                 -minimal-basis sto-3g+minao        > rhco3_case1.out 2>&1
+minpop-uks $COMMON -basis def2-tzvpp                                 -minimal-basis minao               > rhco3_case2.out 2>&1
+minpop-uks $COMMON -basis def2-tzvpp                                 -minimal-basis ano-rcc-mb          > rhco3_case3.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c -minimal-basis ano-rcc-mb         > rhco3_case4.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c-atomic -minimal-basis ano-rcc-mb  > rhco3_case5.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c-atomic -minimal-basis ano-rcc-mb-occ  > rhco3_case6.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c-atomic -minimal-basis sto-3g-ano-occ  > rhco3_case7.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light def2-tzvpp  -x2c-atomic -minimal-basis minao+ano-rcc-mb-occ  > rhco3_case8.out 2>&1
+minpop-uks $COMMON -basis x2c-tzvppall -basis-light def2-tzvpp  -x2c-atomic -minimal-basis ano-rcc-mb  > rhco3_case9.out 2>&1
+minpop-uks $COMMON -basis ano-rcc-vtzp -basis-light "6-31G*"  -x2c-atomic -minimal-basis ano-rcc-mb  > rhco3_case10.out 2>&1
+minpop-uks $COMMON -basis x2c-tzvppall -basis-light "6-31G*"  -x2c-atomic -minimal-basis ano-rcc-mb  > rhco3_case11.out 2>&1
 
-for n in 1 2 3 4 5; do
+for n in 1 2 3 4 5 6 7 8 9 10 11; do
   f=rhco3_case$n.out
   echo "== case $n"
   grep -m1 "Basis:" $f; grep -m1 "Minimal-basis projection" $f
