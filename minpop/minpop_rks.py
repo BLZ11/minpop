@@ -714,9 +714,19 @@ def _get_gaussian_ao_order(mol_min, minimal_basis='sto-3g'):
     """
     from pyscf.data import elements
     
-    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano') or '+' in str(minimal_basis):
-        style = LABEL_STYLE or ('gaussian' if _mbs_key(minimal_basis) == 'sto3gano'
-                                else 'physical')
+    if _mbs_key(minimal_basis) in ('anorccmb', 'sto3gano', 'minao') or '+' in str(minimal_basis):
+        # Default label style: Gaussian's counter where the output is meant to
+        # match Gaussian (sto-3g-ano, minao on light atoms); physical quantum
+        # numbers for ANO-RCC-MB and whenever an atom carries a valence-only
+        # minimal basis (MINAO on an ECP atom), where a counter has no meaning.
+        style = LABEL_STYLE
+        if style is None:
+            if _label_offsets(mol_min):
+                style = 'physical'
+            elif _mbs_key(minimal_basis) in ('sto3gano', 'minao'):
+                style = 'gaussian'
+            else:
+                style = 'physical'
         return _generic_ao_order(mol_min, style)
     
     ao_labels = mol_min.ao_labels(fmt=None)
