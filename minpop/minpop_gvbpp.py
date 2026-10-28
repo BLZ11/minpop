@@ -402,7 +402,7 @@ def run_gvbpp_from_xyz(xyz_file, n_pairs, charge=0, multiplicity=1, basis='6-31+
                        guess='minao', max_cycle=128, soscf=False, x2c=False,
                        minimal_basis='sto-3g', keep_tol=0.5,
                        gvb_guess='auto', gvb_trials=2, gvb_verbose=0, gvb_window=None,
-                       gvb_seed=0, basis_light=None, light_max_z=18):
+                       gvb_seed=0, basis_light=None, light_max_z=18, x2c_atomic=False):
     atom_str = R._read_xyz(xyz_file)
     orient_table = None
     if standard_orientation:
@@ -428,8 +428,13 @@ def run_gvbpp_from_xyz(xyz_file, n_pairs, charge=0, multiplicity=1, basis='6-31+
     mf = scf.ROHF(mol) if mol.spin else scf.RHF(mol)
     if x2c:
         mf = mf.x2c()
+        if x2c_atomic:
+            # atomic (DLU) decoupling: one X2C block per atom, cost linear in
+            # the number of atoms; light atoms contribute negligibly
+            mf.with_x2c.approx = 'atom1e'
         if verbose:
-            print("Hamiltonian: spin-free X2C-1e (scalar relativistic)")
+            print("Hamiltonian: spin-free X2C-1e (scalar relativistic)"
+                  + (", atomic (atom-by-atom) decoupling" if x2c_atomic else ""))
     elif ecp is None and max(mol.atom_charge(i) for i in range(mol.natm)) > 36 and verbose:
         print("WARNING: all-electron basis on an atom beyond Kr without -x2c; "
               "non-relativistic orbitals for such atoms are not physical.")
@@ -497,6 +502,8 @@ def main():
     p.add_argument("-symmetry-shells", "-sigma-pi-shells", dest="symmetry_shells", action="store_true",
                    default=False, help="With -symmetry: also condensed to shells")
     p.add_argument("-x2c", dest="x2c", action="store_true", default=False)
+    p.add_argument("-x2c-atomic", dest="x2c_atomic", action="store_true", default=False,
+                   help="With -x2c: atom-by-atom (DLU) decoupling, linear-scaling")
     p.add_argument("-ecp", default=None)
     p.add_argument("-no-azimuthal-gauge", dest="azimuthal_gauge", action="store_false",
                    default=True)
@@ -534,7 +541,7 @@ def main():
                            gvb_guess=args.gvb_guess, gvb_trials=args.gvb_trials,
                            gvb_verbose=args.gvb_verbose, gvb_window=args.gvb_window,
                            gvb_seed=args.gvb_seed, basis_light=args.basis_light,
-                           light_max_z=args.light_max_z)
+                           light_max_z=args.light_max_z, x2c_atomic=args.x2c_atomic)
     except R.MinPopSCFError as e:
         print(f"MinPop ERROR: {e}")
         sys.exit(1)

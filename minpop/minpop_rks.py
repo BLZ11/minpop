@@ -355,6 +355,25 @@ def _is_transition_metal(atomic_number):
     return any(low <= atomic_number <= high for low, high in TRANSITION_METAL_RANGES)
 
 
+from pyscf.data import elements
+def _sub_mol(mol, idx):
+    """A Mole holding only atoms `idx` of `mol` (coordinates in Bohr), with a
+    neutral even-electron bookkeeping so gto.M never complains about spin.
+    Used only to build per-side minimal basis sets; no integrals are run."""
+    atoms = [[mol.atom_symbol(i), tuple(mol.atom_coord(i))] for i in idx]
+    sub = gto.Mole()
+    sub.atom = atoms
+    sub.unit = 'Bohr'
+    sub.basis = 'sto-3g' if all(
+        elements.charge(''.join(c for c in a[0] if c.isalpha())) <= 54 for a in atoms) else 'ano'
+    sub.charge = 0
+    sub.verbose = 0
+    nel = sum(elements.charge(''.join(c for c in a[0] if c.isalpha())) for a in atoms)
+    sub.spin = nel % 2
+    sub.build(dump_input=False, parse_arg=False)
+    return sub
+
+
 def _build_minimal_basis_mol(mol, minimal_basis='sto-3g'):
     """Minimal-basis molecule for the projection (see _build_minimal_basis_mol_impl).
     Also records the ECP core electron count of each atom of `mol` on the
@@ -413,14 +432,19 @@ def _build_minimal_basis_mol_impl(mol, minimal_basis='sto-3g'):
     if '+' in str(minimal_basis):
         # LIGHT+HEAVY: build each side with this same function and merge.
         light_name, heavy_name = [s.strip() for s in minimal_basis.split('+')]
-        light_mol = _build_minimal_basis_mol_impl(mol, light_name)
-        heavy_mol = _build_minimal_basis_mol_impl(mol, heavy_name)
+        zs = [elements.charge(''.join(c for c in mol.atom_symbol(i) if c.isalpha()))
+              for i in range(mol.natm)]
         basis_dict = {}
-        for i in range(mol.natm):
-            symbol = mol.atom_symbol(i)
-            z = elements.charge(''.join(c for c in symbol if c.isalpha()))
-            src = light_mol if z <= MBS_LIGHT_MAX_Z else heavy_mol
-            basis_dict[symbol] = src._basis[symbol]
+        for name, pick in ((light_name, lambda z: z <= MBS_LIGHT_MAX_Z),
+                           (heavy_name, lambda z: z > MBS_LIGHT_MAX_Z)):
+            idx = [i for i, z in enumerate(zs) if pick(z)]
+            if not idx:
+                continue
+            # build that side on its own atoms only, so a basis that lacks
+            # the other side's elements (STO-3G beyond Xe) is never asked for them
+            side = _build_minimal_basis_mol_impl(_sub_mol(mol, idx), name)
+            for i in idx:
+                basis_dict[mol.atom_symbol(i)] = side._basis[mol.atom_symbol(i)]
         return gto.M(atom=mol.atom, basis=basis_dict, charge=mol.charge,
                      spin=mol.spin, cart=False)
     if key == 'minao':
@@ -1726,6 +1750,7 @@ def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
                       standard_orientation=True, azimuthal_gauge=True,
                       guess='minao', max_cycle=128, soscf=False,
                       cartesian=False, x2c=False, basis_light=None, light_max_z=18,
+                      x2c_atomic=False,
                       minimal_basis='sto-3g',
                      xc='pbe', grid_level=None):
     """
@@ -1835,8 +1860,13 @@ def run_rks_from_xyz(xyz_file, charge=0, multiplicity=1, basis='6-31+G',
     mf = dft.RKS(mol)
     if x2c:
         mf = mf.x2c()
+        if x2c_atomic:
+            # atomic (DLU) decoupling: one X2C block per atom, cost linear in
+            # the number of atoms; light atoms contribute negligibly
+            mf.with_x2c.approx = 'atom1e'
         if verbose:
-            print("Hamiltonian: spin-free X2C-1e (scalar relativistic)")
+            print("Hamiltonian: spin-free X2C-1e (scalar relativistic)"
+                  + (", atomic (atom-by-atom) decoupling" if x2c_atomic else ""))
     elif ecp is None and max(mol.atom_charge(i) for i in range(mol.natm)) > 36 \
             and verbose:
         print("WARNING: all-electron basis on an atom beyond Kr without -x2c; "
@@ -2091,6 +2121,11 @@ Notes:
                              "-basis ano-rcc-vdzp -basis-light 6-31G*")
     parser.add_argument("-light-max-z", dest="light_max_z", type=int, default=18,
                         help="Highest Z that takes -basis-light (default 18)")
+    parser.add_argument("-x2c-atomic", dest="x2c_atomic", action="store_true",
+                        default=False,
+                        help="With -x2c: build the X2C decoupling atom by atom "
+                             "(DLU approximation). Same physics for population "
+                             "analysis, cost linear in the number of atoms.")
     parser.add_argument("-x2c", dest="x2c", action="store_true",
                         default=False,
                         help="Scalar-relativistic sfX2C-1e Hamiltonian. Use "
@@ -2192,6 +2227,7 @@ Notes:
             soscf=args.soscf,
             cartesian=args.cartesian,
             x2c=args.x2c,
+            x2c_atomic=args.x2c_atomic,
             basis_light=args.basis_light,
             light_max_z=args.light_max_z,
             minimal_basis=args.minimal_basis,

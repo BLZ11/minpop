@@ -88,3 +88,11 @@ def test_gvbpp_h2():
     out = run("minpop_gvbpp.py", "-xyz", f"{XYZ}/h2.xyz", "-npairs", "1", "-basis", "cc-pvdz")
     assert "GVB-PP pairs:" in out
     assert "2 of 2 natural orbitals projected" in out
+
+
+def test_sto3g_ano_beyond_xe():
+    """sto-3g-ano must build ANO-RCC-MB on Pt and STO-3G on O without asking STO-3G for Pt."""
+    out = run("minpop_rohf.py", "-xyz", f"{XYZ}/pth.xyz", "-mult", "2", "-basis", "ano-rcc-vdzp",
+              "-basis-light", "6-31G*", "-x2c", "-minimal-basis", "sto-3g-ano")
+    assert "STO-3G on Z<=18, ANO-RCC-MB on Z>18" in out
+    assert abs(charges(out).sum(0)[0]) < 1e-5
